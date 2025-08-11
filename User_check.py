@@ -545,7 +545,7 @@ class AdvancedUsernameClaimer:
 # ============================ نظام الفحص ============================
 class UsernameChecker:
     """نظام فحص وحجز متقدم مع تعدد البوتات"""
-    def __init__(self, bot_clients, session_manager):
+    def __init__(self, bot_clients, session_manager, metrics: dict | None = None):
         self.bot_clients = bot_clients
         self.session_manager = session_manager
         self.current_bot_index = 0
@@ -559,6 +559,7 @@ class UsernameChecker:
         self.cooldown_lock = asyncio.Lock()
         self.last_emergency_time = 0
         self.account_usage_counter = 0
+        self.metrics = metrics  # قاموس عدادات للقياس اللحظي
         
     def get_next_bot_index(self):
         """الحصول على مؤشر البوت التالي مع تخطي المعطلة"""
@@ -612,10 +613,13 @@ class UsernameChecker:
         """المرحلة الأولى: فحص اليوزر"""
         try:
             client, client_type, client_id = await self.get_checker_client()
+            
             try:
                 await client.get_entity(username)
                 async with self.lock:
                     self.reserved_usernames.append(username)
+                if self.metrics is not None:
+                    self.metrics['checked'] = self.metrics.get('checked', 0) + 1
                 # تحديث الحالة في التخزين الدائم
                 run_id = self.session_manager.category_id and None
                 try:
@@ -634,6 +638,8 @@ class UsernameChecker:
                 score = score_username(name_no_at)
                 seq = next(_SEQ)
                 await self.available_usernames_queue.put((score, seq, username))
+                if self.metrics is not None:
+                    self.metrics['checked'] = self.metrics.get('checked', 0) + 1
                 try:
                     # علامة Available
                     # سيتم تعيين run_id الصحيح من السياق في عامل الإنتاج؛ إذا لم يكن متاحاً نتجاهل
@@ -646,6 +652,8 @@ class UsernameChecker:
                 async with self.lock:
                     self.reserved_usernames.append(username)
                     self.fragment_usernames.append(username)
+                if self.metrics is not None:
+                    self.metrics['checked'] = self.metrics.get('checked', 0) + 1
                 try:
                     update_item_status(self.session_manager.sessions and int(self.session_manager.sessions.get('run_id', 0)) or 0, username, ITEM_STATUS_FRAGMENT)
                 except:
@@ -656,6 +664,9 @@ class UsernameChecker:
                 # تحديد وقت الانتظار مع الحد الأقصى
                 wait_time = min(e.seconds + random.randint(10, 30), MAX_COOLDOWN_TIME)
                 logger.warning(f"فيضان! وضع العميل في التبريد لمدة {wait_time} ثانية...")
+                if self.metrics is not None:
+                    self.metrics['flood_events'] = self.metrics.get('flood_events', 0) + 1
+                    self.metrics['flood_seconds'] = self.metrics.get('flood_seconds', 0) + int(e.seconds)
                 
                 # تحديد وقت انتهاء التبريد
                 if client_type == 'bot':
@@ -765,9 +776,13 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
             max_accounts_try = min(5, max(1, len(session_manager.sessions)))
             attempts = 0
             claimed = False
+            # زيادة عداد المحاولات الإجمالي للمقياس
+            context.user_data.setdefault('metrics', {})
+            context.user_data['metrics']['claim_attempts'] = context.user_data['metrics'].get('claim_attempts', 0) + 1
             while attempts < max_accounts_try and not claimed and not stop_event.is_set():
                 account_data = await session_manager.get_account(timeout=60)
                 if account_data is None:
+                    context.user_data['metrics']['account_timeouts'] = context.user_data['metrics'].get('account_timeouts', 0) + 1
                     attempts += 1
                     continue
                 account_id = account_data['account_id']
@@ -796,6 +811,7 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
                             async with checker.lock:
                                 checker.claimed_usernames.append(username)
                             update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_CLAIMED)
+                            context.user_data['metrics']['claim_successes'] = context.user_data['metrics'].get('claim_successes', 0) + 1
                             if progress_callback:
                                 await progress_callback(f"✅ تم تثبيت اليوزر على الحساب: {username}")
                             queue.task_done()
@@ -804,6 +820,7 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
                         except Exception as e:
                             logger.error(f"فشل التثبيت على الحساب مباشرة: {e}")
                             update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                            context.user_data['metrics']['claim_failures'] = context.user_data['metrics'].get('claim_failures', 0) + 1
                             await session_manager.release_account(account_id)
                             attempts += 1
                             continue
@@ -813,6 +830,7 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
                         started = await claimer.start()
                         if not started:
                             update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                            context.user_data['metrics']['claim_failures'] = context.user_data['metrics'].get('claim_failures', 0) + 1
                             await session_manager.release_account(account_id)
                             attempts += 1
                             continue
@@ -823,6 +841,7 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
                         async with checker.lock:
                             checker.claimed_usernames.append(username)
                         update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_CLAIMED)
+                        context.user_data['metrics']['claim_successes'] = context.user_data['metrics'].get('claim_successes', 0) + 1
                         if progress_callback:
                             await progress_callback(f"✅ تم تثبيت اليوزر: {username}")
                         try:
@@ -847,14 +866,17 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
                         claimed = True
                     else:
                         update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                        context.user_data['metrics']['claim_failures'] = context.user_data['metrics'].get('claim_failures', 0) + 1
                         attempts += 1
                 except (UserDeactivatedError, UserDeactivatedBanError):
                     logger.error("الحساب محظور. إزالته من الطابور مؤقتاً.")
                     await session_manager.mark_account_banned(account_id)
+                    context.user_data['metrics']['claim_failures'] = context.user_data['metrics'].get('claim_failures', 0) + 1
                     attempts += 1
                 except Exception as e:
                     logger.error(f"خطأ في عامل التثبيت: {e}")
                     update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                    context.user_data['metrics']['claim_failures'] = context.user_data['metrics'].get('claim_failures', 0) + 1
                     attempts += 1
                 finally:
                     if claimer:
