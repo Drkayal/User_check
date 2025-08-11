@@ -637,7 +637,14 @@ class UsernameChecker:
                 name_no_at = username.lstrip('@')
                 score = score_username(name_no_at)
                 seq = next(_SEQ)
-                await self.available_usernames_queue.put((score, seq, username))
+                if DISTRIBUTED_MODE:
+                    try:
+                        rid = int(getattr(self.session_manager, 'run_id', 0) or 0)
+                    except Exception:
+                        rid = 0
+                    enqueue_p2(rid, username, score)
+                else:
+                    await self.available_usernames_queue.put((score, seq, username))
                 if self.metrics is not None:
                     self.metrics['checked'] = self.metrics.get('checked', 0) + 1
                 try:
@@ -1335,6 +1342,8 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
         if not run_id:
             run_id = create_hunt_run(category_id, pattern, target_type, list(context.user_data.get('extra_usernames_set', set())))
             context.user_data['run_id'] = run_id
+        # حفظ run_id في session_manager للوصول من UsernameChecker
+        session_manager_run_id = run_id
         # تحميل العملاء ...
         if not bot_clients:
             bot_clients = []
@@ -1355,6 +1364,10 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
         )
         session_manager = SessionManager(category_id)
         await session_manager.load_sessions()
+        try:
+            setattr(session_manager, 'run_id', run_id)
+        except Exception:
+            pass
         num_accounts = len(session_manager.sessions)
         if num_accounts == 0:
             await update_progress(context, "❌ لا توجد حسابات متاحة في هذه الفئة!")
@@ -1375,7 +1388,7 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
         generator = UsernameGenerator(pattern)
         total_count = 0
         usernames_queue = asyncio.Queue(maxsize=20000)
-        checker = UsernameChecker(bot_clients, session_manager)
+        checker = UsernameChecker(bot_clients, session_manager)  # metrics wired in multi-task path
         context.user_data['checker'] = checker
         async def progress_callback(message):
             await update_progress(context, 
