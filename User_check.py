@@ -7,6 +7,7 @@ import itertools
 import sqlite3
 import time
 import heapq
+import re
 from datetime import datetime
 from telegram import (
     Update,
@@ -54,6 +55,9 @@ BOT_SESSIONS = [
 # حالات المحادثة
 SELECT_CATEGORY, ENTER_PATTERN, HUNTING_IN_PROGRESS = range(3)
 HUNTING_PAUSED = 3  # حالة جديدة للإيقاف المؤقت
+# حالات جديدة للمرحلة 1
+PREVIEW_PATTERN = 4
+ENTER_NAME_LIST = 5
 
 # ثوابت النظام
 MAX_COOLDOWN_TIME = 150  # أقصى وقت تبريد مسموح به (ساعة واحدة)
@@ -61,6 +65,8 @@ EMERGENCY_THRESHOLD = 150  # 5 دقائق للتحول لحالة الطوارئ
 MIN_WAIT_TIME = 0.5  # الحد الأدنى للانتظار بين الطلبات
 MAX_WAIT_TIME = 3.0  # الحد الأقصى للانتظار بين الطلبات
 ACCOUNT_CHECK_RATIO = 0.3  # نسبة استخدام الحسابات في حالة الطوارئ
+# حد أقصى لمجموعة الأسماء التي تمت زيارتها لتفادي تضخم الذاكرة
+VISITED_MAX_SIZE = int(os.getenv('VISITED_MAX_SIZE', '200000'))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +85,77 @@ TEMPLATE_TYPES = {
     '_': ('literal', '_', ['_']),                      # حرف ثابت
     'bot': ('literal', 'bot', ['bot'])                      # حرف ثابت
 }
+
+# ============== أدوات مساعدة للمرحلة 1: التصفية والمعاينة ==============
+USERNAME_RE = re.compile(r'^[a-z0-9](?:[a-z0-9_]{3,30})[a-z0-9]$')
+
+def normalize_username_input(text: str) -> str:
+    """تطبيع إدخال اسم المستخدم إلى صيغة تبدأ بـ @ وحروف صغيرة."""
+    if not text:
+        return ''
+    name = text.strip().lstrip('@').strip()
+    name = name.lower()
+    return f"@{name}" if name else ''
+
+
+def is_valid_username_local(username: str) -> bool:
+    """التحقق المحلي من صلاحية اسم المستخدم دون طلبات شبكة.
+    القواعد: طول 5-32، أحرف [a-z0-9_] فقط، لا يبدأ/ينتهي بـ '_'، لا يحتوي '__'.
+    """
+    if not username:
+        return False
+    name = username.lstrip('@').lower()
+    if not USERNAME_RE.match(name):
+        return False
+    if '__' in name:
+        return False
+    return True
+
+
+def ensure_visited_capacity(visited: set):
+    """تفادي تضخم الذاكرة لمجموعة visited."""
+    try:
+        if len(visited) > VISITED_MAX_SIZE:
+            visited.clear()
+    except Exception:
+        pass
+
+
+def generate_preview_samples(pattern: str, max_samples: int = 100) -> list:
+    """توليد عينة من أسماء المستخدمين الصالحة بناءً على القالب محلياً."""
+    gen = UsernameGenerator(pattern)
+    samples = []
+    seen = set()
+    try:
+        for username in gen.generate_usernames():
+            if len(samples) >= max_samples:
+                break
+            u = normalize_username_input(username)
+            if u in seen:
+                continue
+            if is_valid_username_local(u):
+                samples.append(u)
+                seen.add(u)
+    except Exception as e:
+        logger.error(f"خطأ أثناء توليد عينة المعاينة: {e}")
+    return samples
+
+
+def parse_username_list(text: str) -> tuple[set, int]:
+    """تحويل نص المستخدم إلى مجموعة أسماء مطبّعة مع عدّاد غير الصالح."""
+    raw_parts = re.split(r'[\s,\n\r]+', text or '')
+    valid_set = set()
+    invalid_count = 0
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
+            continue
+        u = normalize_username_input(part)
+        if is_valid_username_local(u):
+            valid_set.add(u)
+        else:
+            invalid_count += 1
+    return valid_set, invalid_count
 
 # ============================ ديكورات التحقق ============================
 def owner_only(func):
@@ -689,6 +766,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
     return ConversationHandler.END
 
+# معاينة القالب وإدارة القائمة الإضافية
+async def show_pattern_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    pattern = context.user_data.get('pattern', '')
+    extra_usernames = context.user_data.get('extra_usernames_set', set())
+    samples = generate_preview_samples(pattern, max_samples=100)
+    extra_preview = list(sorted(extra_usernames))[:20]
+
+    text_lines = [
+        "🧪 معاينة القالب قبل البدء:\n",
+        f"• القالب: <code>{pattern}</code>",
+        f"• عيّنة من الأسماء ({len(samples)}):",
+        "\n".join(samples) if samples else "لا توجد عيّنة متاحة لهذا القالب.",
+    ]
+    if extra_usernames:
+        text_lines += [
+            "\n— أسماء مضافة يدوياً (عرض حتى 20):",
+            "\n".join(extra_preview)
+        ]
+    text_lines += [
+        "\nاختر إجراء:",
+        "- ابدأ الصيد مباشرة",
+        "- تعديل القالب",
+        "- إضافة قائمة أسماء"
+    ]
+
+    keyboard = [
+        [InlineKeyboardButton("✅ ابدأ الصيد", callback_data="start_hunt_confirm")],
+        [InlineKeyboardButton("✏️ تعديل القالب", callback_data="edit_pattern")],
+        [InlineKeyboardButton("➕ إضافة قائمة أسماء", callback_data="add_name_list")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="start")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            "\n".join(text_lines),
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            "\n".join(text_lines),
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+    return PREVIEW_PATTERN
+
 def get_categories():
     """الحصول على الفئات المتاحة من قاعدة البيانات"""
     try:
@@ -792,29 +916,57 @@ async def select_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @owner_only
 async def enter_pattern(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """بدء عملية الصيد بالقالب المحدد"""
+    """استقبال القالب ثم عرض معاينة قبل البدء"""
     try:
         pattern = update.message.text
         context.user_data['pattern'] = pattern
-        
-        # إرسال رسالة تأكيد
-        msg = await update.message.reply_text(
-            f"⏳ جاري بدء عملية الصيد للقالب: <code>{pattern}</code>...",
-            parse_mode="HTML"
-        )
-        context.user_data['progress_message_id'] = msg.message_id
-        context.user_data['chat_id'] = update.message.chat_id
-        
-        # بدء عملية الصيد في الخلفية
-        asyncio.create_task(start_hunting(update, context))
-        
-        return HUNTING_IN_PROGRESS
-        
+        # تهيئة قائمة الأسماء المضافة وvisited إن لم تكن موجودة
+        context.user_data.setdefault('extra_usernames_set', set())
+        context.user_data.setdefault('visited', set())
+        # عرض المعاينة
+        return await show_pattern_preview(update, context)
     except Exception as e:
         logger.error(f"خطأ في enter_pattern: {e}")
-        await update.message.reply_text("❌ حدث خطأ أثناء بدء عملية الصيد.")
+        await update.message.reply_text("❌ حدث خطأ أثناء معالجة القالب.")
         return ConversationHandler.END
 
+@owner_only
+async def request_edit_pattern(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """إعادة طلب القالب من المستخدم"""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("✏️ أرسل القالب الجديد الآن:")
+    return ENTER_PATTERN
+
+@owner_only
+async def prompt_name_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """طلب إرسال قائمة أسماء من المستخدم"""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📝 أرسل قائمة الأسماء (سطر لكل اسم أو مفصولة بفواصل).\n"
+        "سيتم التحقق محلياً ودمج الصالح مع القالب."
+    )
+    return ENTER_NAME_LIST
+
+@owner_only
+async def receive_name_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """استقبال قائمة الأسماء النصية ودمجها"""
+    text = update.message.text or ''
+    valid_set, invalid_count = parse_username_list(text)
+    extra_set = context.user_data.get('extra_usernames_set', set())
+    before = len(extra_set)
+    extra_set |= valid_set
+    context.user_data['extra_usernames_set'] = extra_set
+    added = len(extra_set) - before
+    await update.message.reply_text(
+        f"✅ تم قبول {added} اسم صالح. ❌ غير صالح: {invalid_count}.\n"
+        f"الإجمالي الآن: {len(extra_set)}.\n\nسيتم عرض معاينة محدثة..."
+    )
+    # عرض المعاينة مجدداً
+    return await show_pattern_preview(update, context)
+
+# إضافة دالة مساعدة لتحديث رسالة التقدم
 async def update_progress(context, message):
     """تحديث رسالة التقدم"""
     try:
@@ -828,6 +980,22 @@ async def update_progress(context, message):
         logger.error(f"خطأ في تحديث التقدم: {e}")
 
 @owner_only
+async def confirm_start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """تأكيد البدء بعد المعاينة وبدء عملية الصيد"""
+    query = update.callback_query
+    await query.answer()
+    # إرسال رسالة التقدم وبدء الصيد
+    msg = await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=f"⏳ جاري بدء عملية الصيد للقالب: <code>{context.user_data.get('pattern','')}</code>...",
+        parse_mode="HTML"
+    )
+    context.user_data['progress_message_id'] = msg.message_id
+    context.user_data['chat_id'] = query.message.chat_id
+    # بدء عملية الصيد في الخلفية
+    asyncio.create_task(start_hunting(update, context))
+    return HUNTING_IN_PROGRESS
+
 async def resume_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """استئناف عملية الصيد الأخيرة"""
     query = update.callback_query
@@ -843,13 +1011,15 @@ async def resume_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pattern = hunt_data['pattern']
     progress_message_id = hunt_data['progress_message_id']
     chat_id = hunt_data['chat_id']
+    extra_usernames = hunt_data.get('extra_usernames', [])
     
     # تخزين البيانات في context.user_data للعملية الجارية
     context.user_data.update({
         'category_id': category_id,
         'pattern': pattern,
         'progress_message_id': progress_message_id,
-        'chat_id': chat_id
+        'chat_id': chat_id,
+        'extra_usernames_set': set(extra_usernames)
     })
     
     # تحديث رسالة التقدم
@@ -954,6 +1124,7 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                     session_manager, 
                     stop_event,
                     pause_event,
+                    context,
                     progress_callback
                 )
             )
@@ -966,26 +1137,52 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             )
             tasks.append(task)
         
-        # مهمة لتوليد اليوزرات باستخدام الدفعات
+        # مهمة لتوليد اليوزرات باستخدام الدفعات + دمج القائمة اليدوية + منع التكرار
         async def generate_usernames():
             nonlocal total_count
+            visited: set = context.user_data.setdefault('visited', set())
+            extra_usernames: set = context.user_data.get('extra_usernames_set', set())
             count = 0
             BATCH_SIZE = 1000  # حجم الدفعة
             batch = []
             
             try:
+                # أولاً: إدراج الأسماء المضافة يدوياً
+                for extra in list(extra_usernames):
+                    if stop_event.is_set():
+                        break
+                    if pause_event.is_set():
+                        await asyncio.sleep(1)
+                        continue
+                    u = normalize_username_input(extra)
+                    if not is_valid_username_local(u):
+                        continue
+                    if u in visited:
+                        continue
+                    ensure_visited_capacity(visited)
+                    visited.add(u)
+                    await usernames_queue.put(u)
+                    count += 1
+                    total_count = count
+                
+                # ثانياً: توليد من القالب على دفعات
                 for username in generator.generate_usernames():
                     if stop_event.is_set():
                         break
                     if pause_event.is_set():
                         await asyncio.sleep(1)
                         continue
-                        
-                    batch.append(username)
+                    u = normalize_username_input(username)
+                    if not is_valid_username_local(u):
+                        continue
+                    if u in visited:
+                        continue
+                    batch.append(u)
                     if len(batch) >= BATCH_SIZE:
-                        # إضافة الدفعة كاملة إلى الطابور
-                        for u in batch:
-                            await usernames_queue.put(u)
+                        for u2 in batch:
+                            ensure_visited_capacity(visited)
+                            visited.add(u2)
+                            await usernames_queue.put(u2)
                         count += len(batch)
                         total_count = count
                         batch = []
@@ -994,8 +1191,10 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                 
                 # إضافة ما تبقى
                 if batch:
-                    for u in batch:
-                        await usernames_queue.put(u)
+                    for u2 in batch:
+                        ensure_visited_capacity(visited)
+                        visited.add(u2)
+                        await usernames_queue.put(u2)
                     count += len(batch)
                     total_count = count
                 
@@ -1006,8 +1205,10 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             except asyncio.CancelledError:
                 # إضافة ما تبقى في حالة الإلغاء
                 if batch:
-                    for u in batch:
-                        await usernames_queue.put(u)
+                    for u2 in batch:
+                        ensure_visited_capacity(visited)
+                        visited.add(u2)
+                        await usernames_queue.put(u2)
                     count += len(batch)
                 raise
             return count
@@ -1061,7 +1262,8 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             'category_id': category_id,
             'pattern': pattern,
             'progress_message_id': context.user_data['progress_message_id'],
-            'chat_id': context.user_data['chat_id']
+            'chat_id': context.user_data['chat_id'],
+            'extra_usernames': list(context.user_data.get('extra_usernames_set', set()))
         }
         
         await update_progress(context, "⏸ تم إيقاف العملية مؤقتاً. يمكنك استئنافها من القائمة الرئيسية.")
@@ -1179,7 +1381,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """معالجة الأخطاء العامة"""
     logger.error(f"حدث خطأ: {context.error}", exc_info=True)
-    if update.effective_message:
+    if update and update.effective_message:
         await update.effective_message.reply_text("❌ حدث خطأ غير متوقع أثناء المعالجة.")
 
 def main() -> None:
@@ -1199,6 +1401,15 @@ def main() -> None:
             ],
             ENTER_PATTERN: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, enter_pattern)
+            ],
+            PREVIEW_PATTERN: [
+                CallbackQueryHandler(confirm_start_hunt, pattern="^start_hunt_confirm$"),
+                CallbackQueryHandler(request_edit_pattern, pattern="^edit_pattern$"),
+                CallbackQueryHandler(prompt_name_list, pattern="^add_name_list$"),
+                CallbackQueryHandler(start, pattern="^start$")
+            ],
+            ENTER_NAME_LIST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name_list)
             ],
             HUNTING_IN_PROGRESS: [
                 CommandHandler("pause", pause_hunt),
