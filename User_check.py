@@ -2191,28 +2191,138 @@ def get_last_active_run() -> dict | None:
         logger.error(f"get_last_active_run error: {e}")
         return None
 
+# ============================ طوابير موزعة عبر SQLite (المرحلة 9) ============================
+DISTRIBUTED_MODE = os.getenv('DISTRIBUTED_MODE', '0') == '1'
+LEASE_SECONDS = 30
 
-def load_items_for_resume(run_id: int) -> tuple[list[tuple[float,int,str]], list[tuple[float,int,str]], set[str]]:
-    """إرجاع (pending_for_phase1, available_for_phase2, visited_set). عناصر الطوابير كـ (score, seq, @username)."""
-    pending = []
-    available = []
-    visited = set()
+def init_distributed_queues():
+    if not DISTRIBUTED_MODE:
+        return
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            conn.execute('PRAGMA journal_mode=WAL;')
+            conn.execute('PRAGMA synchronous=NORMAL;')
             cur = conn.cursor()
-            cur.execute('SELECT username, status, score FROM hunt_items WHERE run_id=?', (run_id,))
-            rows = cur.fetchall()
-            for uname, status, score in rows:
-                u = f"@{uname}"
-                visited.add(u)
-                if status in (ITEM_STATUS_PENDING,):
-                    pending.append((float(score), next(_SEQ), u))
-                elif status in (ITEM_STATUS_AVAILABLE,):
-                    available.append((float(score), next(_SEQ), u))
-            return pending, available, visited
+            cur.execute('''CREATE TABLE IF NOT EXISTS hunt_queue_p1 (
+                               run_id INTEGER,
+                               username TEXT,
+                               created_at TEXT,
+                               leased_by TEXT,
+                               lease_until REAL,
+                               PRIMARY KEY(run_id, username)
+                           )''')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_q1_lease ON hunt_queue_p1(run_id, lease_until)')
+            cur.execute('''CREATE TABLE IF NOT EXISTS hunt_queue_p2 (
+                               run_id INTEGER,
+                               username TEXT,
+                               score REAL,
+                               created_at TEXT,
+                               leased_by TEXT,
+                               lease_until REAL,
+                               PRIMARY KEY(run_id, username)
+                           )''')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_q2_lease ON hunt_queue_p2(run_id, lease_until, score)')
+            conn.commit()
     except Exception as e:
-        logger.error(f"load_items_for_resume error: {e}")
-        return pending, available, visited
+        logger.error(f"init_distributed_queues error: {e}")
+
+
+def enqueue_p1_batch(run_id: int, usernames: list[str]):
+    if not DISTRIBUTED_MODE or not usernames:
+        return
+    try:
+        rows = [(run_id, u.lstrip('@').lower(), datetime.utcnow().isoformat(), None, None) for u in usernames]
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            conn.execute('PRAGMA journal_mode=WAL;')
+            conn.executemany('INSERT OR IGNORE INTO hunt_queue_p1(run_id,username,created_at,leased_by,lease_until) VALUES (?,?,?,?,?)', rows)
+            conn.commit()
+    except Exception as e:
+        logger.error(f"enqueue_p1_batch error: {e}")
+
+
+def enqueue_p2(run_id: int, username: str, score: float):
+    if not DISTRIBUTED_MODE:
+        return
+    try:
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            conn.execute('PRAGMA journal_mode=WAL;')
+            conn.execute('INSERT OR IGNORE INTO hunt_queue_p2(run_id,username,score,created_at,leased_by,lease_until) VALUES (?,?,?,?,?,?)',
+                         (run_id, username.lstrip('@').lower(), float(score), datetime.utcnow().isoformat(), None, None))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"enqueue_p2 error: {e}")
+
+
+def lease_p1(run_id: int, worker_id: str) -> str | None:
+    if not DISTRIBUTED_MODE:
+        return None
+    try:
+        now = time.time()
+        lease_until = now + LEASE_SECONDS
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            conn.execute('PRAGMA journal_mode=WAL;')
+            cur = conn.cursor()
+            cur.execute('SELECT username FROM hunt_queue_p1 WHERE run_id=? AND (lease_until IS NULL OR lease_until < ?) LIMIT 1', (run_id, now))
+            row = cur.fetchone()
+            if not row:
+                return None
+            uname = row[0]
+            cur.execute('UPDATE hunt_queue_p1 SET leased_by=?, lease_until=? WHERE run_id=? AND username=? AND (lease_until IS NULL OR lease_until < ?)',
+                        (worker_id, lease_until, run_id, uname, now))
+            if cur.rowcount == 0:
+                return None
+            conn.commit()
+            return f"@{uname}"
+    except Exception as e:
+        logger.error(f"lease_p1 error: {e}")
+        return None
+
+
+def complete_p1(run_id: int, username: str):
+    if not DISTRIBUTED_MODE:
+        return
+    try:
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            conn.execute('DELETE FROM hunt_queue_p1 WHERE run_id=? AND username=?', (run_id, username.lstrip('@').lower()))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"complete_p1 error: {e}")
+
+
+def lease_p2(run_id: int, worker_id: str) -> tuple[float,str] | None:
+    if not DISTRIBUTED_MODE:
+        return None
+    try:
+        now = time.time()
+        lease_until = now + LEASE_SECONDS
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            conn.execute('PRAGMA journal_mode=WAL;')
+            cur = conn.cursor()
+            cur.execute('SELECT username, score FROM hunt_queue_p2 WHERE run_id=? AND (lease_until IS NULL OR lease_until < ?) ORDER BY score ASC LIMIT 1', (run_id, now))
+            row = cur.fetchone()
+            if not row:
+                return None
+            uname, score = row
+            cur.execute('UPDATE hunt_queue_p2 SET leased_by=?, lease_until=? WHERE run_id=? AND username=? AND (lease_until IS NULL OR lease_until < ?)',
+                        (worker_id, lease_until, run_id, uname, now))
+            if cur.rowcount == 0:
+                return None
+            conn.commit()
+            return (float(score), f"@{uname}")
+    except Exception as e:
+        logger.error(f"lease_p2 error: {e}")
+        return None
+
+
+def complete_p2(run_id: int, username: str):
+    if not DISTRIBUTED_MODE:
+        return
+    try:
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            conn.execute('DELETE FROM hunt_queue_p2 WHERE run_id=? AND username=?', (run_id, username.lstrip('@').lower()))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"complete_p2 error: {e}")
 
 # سياق خفيف للمهام المتوازية لعزل user_data
 class RuntimeContext:
