@@ -32,6 +32,7 @@ from telethon.errors import (
     ChannelInvalidError, UserDeactivatedError, UserDeactivatedBanError,
     UsernamePurchaseAvailableError
 )
+from telethon import functions
 from telethon.tl.functions.channels import CreateChannelRequest, UpdateUsernameRequest, DeleteChannelRequest
 from telethon.tl.types import Channel, InputChannel
 from encryption import decrypt_session
@@ -278,10 +279,10 @@ class UsernameGenerator:
 class SessionManager:
     """مدير جلسات متقدم مع دعم الفئات"""
     def __init__(self, category_id=None):
-        self.sessions = {}  # {account_id: {'client': TelegramClient, 'channel': InputChannel}}
+        self.sessions = {}  # {account_id: {'client': TelegramClient, 'phone': str}}
         self.accounts_queue = asyncio.PriorityQueue()  # (priority, account_id)
         self.category_id = category_id
-        self.created_channels = []  # لتخزين القنوات التي تم إنشاؤها
+        self.channel_pool = {}  # {account_id: [{'channel': InputChannel, 'used': bool}]}
         self.account_priority = {}  # {account_id: priority (wait time)}
         self.banned_accounts = set()  # الحسابات المحظورة مؤقتاً
         
@@ -303,24 +304,16 @@ class SessionManager:
                 
             for account_id, encrypted_session, phone in accounts:
                 try:
-                    # فك تشفير الجلسة
                     session_str = decrypt_session(encrypted_session)
-                    
-                    # إنشاء عميل تيليثون
                     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
                     await client.connect()
-                    
                     if not client.is_connected():
                         await client.start()
-                    
-                    # التحقق من أن الحساب غير محظور
                     try:
                         me = await client.get_me()
                         if me.bot:
                             logger.error(f"الحساب بوت: {phone} - لا يمكن استخدام البوتات في هذه العملية")
                             continue
-                            
-                        # محاولة بسيطة للتأكد من عدم حظر الحساب
                         await client.get_dialogs(limit=1)
                     except (UserDeactivatedError, UserDeactivatedBanError, ChannelInvalidError) as e:
                         logger.error(f"الحساب محظور أو معطل: {phone} - {e}")
@@ -328,36 +321,13 @@ class SessionManager:
                     except Exception as e:
                         logger.error(f"خطأ في التحقق من الحساب {phone}: {e}")
                         continue
-                    
-                    # إنشاء قناة احتياطية
-                    try:
-                        channel_name = f"Reserve Channel {random.randint(10000, 99999)}"
-                        channel = await client(CreateChannelRequest(
-                            title=channel_name,
-                            about="قناة مؤقتة لتثبيت اليوزرات",
-                            megagroup=False
-                        ))
-                        chat = channel.chats[0]
-                        if not isinstance(chat, Channel):
-                            logger.error(f"فشل إنشاء القناة للحساب {phone}: النوع غير صحيح")
-                            continue
-                            
-                        # تخزين كائن InputChannel كاملاً
-                        input_channel = InputChannel(chat.id, chat.access_hash)
-                        logger.info(f"تم إنشاء القناة الاحتياطية: {chat.id} للحساب {phone}")
-                        self.created_channels.append((client, input_channel, account_id))
-                    except Exception as e:
-                        logger.error(f"خطأ في إنشاء القناة للحساب {phone}: {e}")
-                        continue
-                    
-                    # تخزين الجلسة
+                    # تخزين الجلسة بدون إنشاء قناة مبكراً
                     self.sessions[account_id] = {
                         'client': client,
-                        'input_channel': input_channel,
                         'phone': phone,
                         'account_id': account_id
                     }
-                    # إضافة الحساب إلى الطابور بالأولوية (0 أولوية عالية)
+                    self.channel_pool.setdefault(account_id, [])
                     self.account_priority[account_id] = 0
                     await self.accounts_queue.put((0, account_id))
                     logger.info(f"تم تحميل الجلسة: {phone}")
@@ -368,6 +338,46 @@ class SessionManager:
         except Exception as e:
             logger.error(f"خطأ في قراءة قاعدة البيانات: {str(e)}")
     
+    async def get_or_create_channel(self, account_id: str, target_type: str = 'channel', pool_limit: int = 2) -> InputChannel | None:
+        """الحصول على قناة جاهزة من مسبح الحساب أو إنشاء قناة جديدة عند الحاجة."""
+        pool = self.channel_pool.setdefault(account_id, [])
+        # إعادة استخدام قناة غير مستخدمة إن وجدت
+        for entry in pool:
+            if not entry.get('used'):
+                return entry.get('channel')
+        # إنشاء عند الحاجة إذا لم يتجاوز الحد
+        if len(pool) >= pool_limit:
+            # لا توجد قناة متاحة وغير مستخدمة ضمن الحد
+            return None
+        try:
+            client = self.sessions[account_id]['client']
+            channel_name = f"Reserve {'Group' if target_type=='group' else 'Channel'} {random.randint(10000, 99999)}"
+            is_group = (target_type == 'group')
+            created = await client(CreateChannelRequest(
+                title=channel_name,
+                about="قناة/مجموعة مؤقتة لتثبيت اليوزرات",
+                megagroup=is_group
+            ))
+            chat = created.chats[0]
+            if not isinstance(chat, Channel):
+                logger.error(f"فشل إنشاء {'مجموعة' if is_group else 'قناة'} للحساب {account_id}: النوع غير صحيح")
+                return None
+            input_channel = InputChannel(chat.id, chat.access_hash)
+            pool.append({'channel': input_channel, 'used': False})
+            logger.info(f"تم إنشاء {( 'مجموعة' if is_group else 'قناة')} احتياطية: {chat.id} للحساب {account_id}")
+            return input_channel
+        except Exception as e:
+            logger.error(f"خطأ في إنشاء القناة للحساب {account_id}: {e}")
+            return None
+
+    def mark_channel_used(self, account_id: str, input_channel: InputChannel) -> None:
+        pool = self.channel_pool.get(account_id, [])
+        for entry in pool:
+            ch = entry.get('channel')
+            if isinstance(ch, InputChannel) and ch.channel_id == input_channel.channel_id:
+                entry['used'] = True
+                break
+
     async def get_account(self, timeout=30):
         """الحصول على حساب متاح من الطابور مع مهلة"""
         try:
@@ -405,14 +415,19 @@ class SessionManager:
     
     async def cleanup_unused_channels(self):
         """حذف القنوات التي لم يتم استخدامها (لم يثبت عليها يوزر)"""
-        for client, input_channel, account_id in self.created_channels:
-            # إذا كان الحساب لا يزال في القائمة ولم يتم حظره، والقناة لم تستخدم للتثبيت، نحذفها
-            if account_id in self.sessions and account_id not in self.banned_accounts:
-                try:
-                    await client(DeleteChannelRequest(channel=input_channel))
-                    logger.info(f"تم حذف القناة الاحتياطية غير المستخدمة: {input_channel.channel_id}")
-                except Exception as e:
-                    logger.error(f"خطأ في حذف القناة {input_channel.channel_id}: {e}")
+        for account_id, pool in self.channel_pool.items():
+            if account_id not in self.sessions or account_id in self.banned_accounts:
+                continue
+            client = self.sessions[account_id]['client']
+            for entry in list(pool):
+                if not entry.get('used'):
+                    ch = entry.get('channel')
+                    try:
+                        await client(DeleteChannelRequest(channel=ch))
+                        logger.info(f"تم حذف القناة/المجموعة غير المستخدمة: {ch.channel_id}")
+                        pool.remove(entry)
+                    except Exception as e:
+                        logger.error(f"خطأ في حذف القناة {ch.channel_id}: {e}")
 
 # ============================ نظام الحجز ============================
 class AdvancedUsernameClaimer:
@@ -1611,6 +1626,86 @@ def apply_speed_mode(context: ContextTypes.DEFAULT_TYPE, mode: str, num_accounts
     context.user_data['mode'] = mode
     return f"تم ضبط الوضع إلى {mode}. عمال المرحلة1={targets['phase1']}, المرحلة2={targets['phase2']}, الانتظار={runtime['min_wait']}-{runtime['max_wait']} ثانية."
 
+# اختيار هدف التثبيت قبل البدء
+TARGET_TYPES = {
+    'channel': 'قناة مؤقتة',
+    'group': 'مجموعة مؤقتة',
+    'self': 'الحساب نفسه'
+}
+
+@owner_only
+async def choose_target_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("📢 قناة مؤقتة", callback_data="target_channel")],
+        [InlineKeyboardButton("👥 مجموعة مؤقتة", callback_data="target_group")],
+        [InlineKeyboardButton("👤 الحساب نفسه", callback_data="target_self")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="start")]
+    ]
+    await query.edit_message_text(
+        "🎯 اختر هدف التثبيت الافتراضي:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return SELECT_CATEGORY
+
+# تعديل البداية لعرض اختيار الهدف أولاً
+@owner_only
+async def choose_session_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        query = update.callback_query
+        await query.answer()
+        # تخزين هدف افتراضي إن لم يوجد
+        context.user_data.setdefault('target_type', 'channel')
+        # عرض اختيار الهدف قبل اختيار الفئة
+        return await choose_target_type(update, context)
+    except Exception as e:
+        logger.error(f"خطأ في choose_session_source: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ حدث خطأ أثناء التهيئة."
+        )
+        return ConversationHandler.END
+
+@owner_only
+async def target_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == 'target_channel':
+        context.user_data['target_type'] = 'channel'
+    elif data == 'target_group':
+        context.user_data['target_type'] = 'group'
+    elif data == 'target_self':
+        context.user_data['target_type'] = 'self'
+    # بعد اختيار الهدف نعرض الفئات كما كان
+    categories = get_categories()
+    if not categories:
+        text = "❌ لا توجد فئات متاحة. تأكد من وجود حسابات في قاعدة البيانات."
+        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="start")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text, reply_markup=reply_markup)
+        return SELECT_CATEGORY
+    keyboard = []
+    for cat_id, name in categories:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM accounts WHERE category_id = ? AND is_active = 1", (cat_id,))
+                count = cursor.fetchone()[0]
+            button_text = f"{name} ({count} حساب)"
+        except Exception as e:
+            logger.error(f"خطأ في حساب عدد الحسابات للفئة {cat_id}: {e}")
+            button_text = name
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"cat_{cat_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="start")])
+    await query.edit_message_text(
+        "📂 <b>الخطوة 2: اختيار فئة الحسابات</b>\n\nاختر الفئة التي تريد استخدامها للصيد",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return SELECT_CATEGORY
+
 def main() -> None:
     """تشغيل البوت"""
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1623,6 +1718,7 @@ def main() -> None:
         ],
         states={
             SELECT_CATEGORY: [
+                CallbackQueryHandler(target_selected, pattern=r"^target_(channel|group|self)$"),
                 CallbackQueryHandler(select_category, pattern=r"^cat_.+$"),
                 CallbackQueryHandler(start, pattern="^start$")
             ],
