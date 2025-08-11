@@ -1533,6 +1533,8 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             for username in checker.fragment_usernames:
                 f.write(f"{username}\n")
         await update_progress(context, result_message)
+        # إرسال تقارير CSV/JSON تلقائياً للمالكين
+        await send_final_reports(context, run_id)
         await session_manager.cleanup_unused_channels()
     except asyncio.CancelledError:
         logger.info("تم إلغاء عملية الصيد")
@@ -1644,9 +1646,38 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 @owner_only
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """عرض حالة المهام الجارية"""
-    # يمكن تطوير هذه الوظيفة لعرض حالة أكثر تفصيلاً
-    await update.message.reply_text("🔄 جاري التحقق من حالة المهام...")
+    run = get_last_active_run()
+    checker: 'UsernameChecker' = context.user_data.get('checker')
+    usernames_queue: asyncio.Queue = context.user_data.get('usernames_queue')
+    p1 = usernames_queue.qsize() if usernames_queue else 0
+    p2 = checker.available_usernames_queue.qsize() if checker else 0
+    claimed = len(checker.claimed_usernames) if checker else 0
+    reserved = len(checker.reserved_usernames) if checker else 0
+    fragment = len(checker.fragment_usernames) if checker else 0
+    phase1_workers = len(context.user_data.get('phase1_tasks', []))
+    phase2_workers = len(context.user_data.get('phase2_tasks', []))
+    runtime = context.user_data.get('runtime', {})
+    mode = context.user_data.get('mode', 'normal')
+    msg = (
+        f"📊 الحالة الحالية:\n"
+        f"• وضع السرعة: {mode} ({runtime.get('min_wait','?')}-{runtime.get('max_wait','?')}s)\n"
+        f"• عمال المرحلة1/2: {phase1_workers}/{phase2_workers}\n"
+        f"• طوابير المرحلة1/2: {p1}/{p2}\n"
+        f"• محجوزة (فحص): {reserved} | Fragment: {fragment} | محجوزة بنجاح: {claimed}\n"
+    )
+    await update.message.reply_text(msg)
+
+@owner_only
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    run = get_last_active_run()
+    if not run:
+        await update.message.reply_text("❌ لا توجد مهمة لتوليد تقرير لها.")
+        return
+    await update.message.reply_text("⏳ جاري تجهيز التقرير...")
+    await send_final_reports(context, run['id'])
+    # زر أفضل 100
+    keyboard = [[InlineKeyboardButton("🏆 أفضل 100 اسم", callback_data="show_top100")]]
+    await update.message.reply_text("اختر لعرض أفضل 100 اسم محجوز:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """معالجة الأخطاء العامة"""
@@ -1896,6 +1927,23 @@ def init_hunt_tables():
                     value TEXT
                 )'''
             )
+            # أعمدة إضافية اختيارية
+            try:
+                cur.execute('ALTER TABLE hunt_items ADD COLUMN account_id TEXT')
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute('ALTER TABLE hunt_items ADD COLUMN failure_reason TEXT')
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute('ALTER TABLE hunt_items ADD COLUMN claimed_at TEXT')
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute('ALTER TABLE hunt_items ADD COLUMN checked_at TEXT')
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
     except Exception as e:
         logger.error(f"init_hunt_tables error: {e}")
@@ -1962,26 +2010,138 @@ def update_item_status(run_id: int, username: str, status: str, inc_attempt: boo
         name = username.lstrip('@').lower()
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
+            checked_at = datetime.utcnow().isoformat() if status in (ITEM_STATUS_AVAILABLE, ITEM_STATUS_RESERVED, ITEM_STATUS_FRAGMENT) else None
             if inc_attempt:
-                cur.execute(
-                    'UPDATE hunt_items SET status=?, last_attempt_ts=?, attempts=attempts+1 WHERE run_id=? AND username=?',
-                    (status, datetime.utcnow().isoformat(), run_id, name)
-                )
+                if checked_at:
+                    cur.execute(
+                        'UPDATE hunt_items SET status=?, last_attempt_ts=?, attempts=attempts+1, checked_at=COALESCE(checked_at,?) WHERE run_id=? AND username=?',
+                        (status, datetime.utcnow().isoformat(), checked_at, run_id, name)
+                    )
+                else:
+                    cur.execute(
+                        'UPDATE hunt_items SET status=?, last_attempt_ts=?, attempts=attempts+1 WHERE run_id=? AND username=?',
+                        (status, datetime.utcnow().isoformat(), run_id, name)
+                    )
             else:
-                cur.execute(
-                    'UPDATE hunt_items SET status=?, last_attempt_ts=? WHERE run_id=? AND username=?',
-                    (status, datetime.utcnow().isoformat(), run_id, name)
-                )
-            # إذا لم يكن موجوداً مسبقاً، أدخله
+                if checked_at:
+                    cur.execute(
+                        'UPDATE hunt_items SET status=?, last_attempt_ts=?, checked_at=COALESCE(checked_at,?) WHERE run_id=? AND username=?',
+                        (status, datetime.utcnow().isoformat(), checked_at, run_id, name)
+                    )
+                else:
+                    cur.execute(
+                        'UPDATE hunt_items SET status=?, last_attempt_ts=? WHERE run_id=? AND username=?',
+                        (status, datetime.utcnow().isoformat(), run_id, name)
+                    )
             if cur.rowcount == 0:
                 cur.execute(
-                    'INSERT OR IGNORE INTO hunt_items(run_id,username,status,score,last_attempt_ts,attempts) VALUES (?,?,?,?,?,?)',
-                    (run_id, name, status, float(score_username(name)), datetime.utcnow().isoformat(), 1 if inc_attempt else 0)
+                    'INSERT OR IGNORE INTO hunt_items(run_id,username,status,score,last_attempt_ts,attempts,checked_at) VALUES (?,?,?,?,?,?,?)',
+                    (run_id, name, status, float(score_username(name)), datetime.utcnow().isoformat(), 1 if inc_attempt else 0, checked_at)
                 )
             conn.commit()
     except Exception as e:
         logger.error(f"update_item_status error: {e}")
 
+
+def set_item_claimed(run_id: int, username: str, account_id: str):
+    try:
+        name = username.lstrip('@').lower()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                'UPDATE hunt_items SET status=?, claimed_at=?, account_id=? WHERE run_id=? AND username=?',
+                (ITEM_STATUS_CLAIMED, datetime.utcnow().isoformat(), account_id, run_id, name)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"set_item_claimed error: {e}")
+
+
+def set_item_failed(run_id: int, username: str, reason: str):
+    try:
+        name = username.lstrip('@').lower()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                'UPDATE hunt_items SET status=?, failure_reason=? WHERE run_id=? AND username=?',
+                (ITEM_STATUS_FAILED, reason[:200], run_id, name)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"set_item_failed error: {e}")
+
+
+def generate_report_files(run_id: int) -> tuple[str, str]:
+    csv_path = f"hunt_report_{run_id}.csv"
+    json_path = f"hunt_report_{run_id}.json"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute('''SELECT username,status,score,last_attempt_ts,attempts,account_id,failure_reason,claimed_at,checked_at 
+                           FROM hunt_items WHERE run_id=?''', (run_id,))
+            rows = cur.fetchall()
+        # JSON
+        data = []
+        for r in rows:
+            data.append({
+                'username': f"@{r[0]}",
+                'status': r[1],
+                'score': r[2],
+                'last_attempt_ts': r[3],
+                'attempts': r[4],
+                'account_id': r[5],
+                'failure_reason': r[6],
+                'claimed_at': r[7],
+                'checked_at': r[8]
+            })
+        with open(json_path, 'w', encoding='utf-8') as jf:
+            json.dump(data, jf, ensure_ascii=False, indent=2)
+        # CSV
+        import csv
+        with open(csv_path, 'w', encoding='utf-8', newline='') as cf:
+            writer = csv.writer(cf)
+            writer.writerow(['username','status','score','last_attempt_ts','attempts','account_id','failure_reason','claimed_at','checked_at'])
+            for r in rows:
+                writer.writerow([f"@{r[0]}", r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]])
+        return csv_path, json_path
+    except Exception as e:
+        logger.error(f"generate_report_files error: {e}")
+        return '', ''
+
+async def send_final_reports(context: ContextTypes.DEFAULT_TYPE, run_id: int):
+    csv_path, json_path = generate_report_files(run_id)
+    if not csv_path and not json_path:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            if csv_path:
+                await context.bot.send_document(chat_id=admin_id, document=open(csv_path, 'rb'), filename=os.path.basename(csv_path), caption=f"تقرير CSV للمهمة {run_id}")
+            if json_path:
+                await context.bot.send_document(chat_id=admin_id, document=open(json_path, 'rb'), filename=os.path.basename(json_path), caption=f"تقرير JSON للمهمة {run_id}")
+        except Exception as e:
+            logger.error(f"send_final_reports error: {e}")
+
+@owner_only
+async def top100_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    run = get_last_active_run()
+    if not run:
+        await query.edit_message_text("❌ لا توجد مهمة لعرضها.")
+        return
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute('''SELECT username, score FROM hunt_items WHERE run_id=? AND status=? ORDER BY score ASC LIMIT 100''',
+                        (run['id'], ITEM_STATUS_CLAIMED))
+            rows = cur.fetchall()
+        if not rows:
+            await query.edit_message_text("لا توجد نتائج محجوزة لعرض أفضل 100.")
+            return
+        lines = [f"@{u} — {s}" for (u, s) in rows]
+        text = "🏆 أفضل 100 (أقل score):\n\n" + "\n".join(lines)
+        await query.edit_message_text(text)
+    except Exception as e:
+        logger.error(f"top100_handler error: {e}")
+        await query.edit_message_text("❌ خطأ أثناء عرض أفضل 100.")
 
 def get_last_active_run() -> dict | None:
     try:
@@ -2102,6 +2262,7 @@ def main() -> None:
     application.add_handler(CommandHandler("block", cmd_block))
     application.add_handler(CommandHandler("allow", cmd_allow))
     application.add_handler(CommandHandler("addnames", cmd_addnames))
+    application.add_handler(CommandHandler("report", report_command))
     application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
     
