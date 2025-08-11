@@ -644,7 +644,7 @@ class UsernameChecker:
             return "error"
 
 # ============================ عمال المعالجة ============================
-async def worker_bot_check(queue, checker, stop_event, pause_event):
+async def worker_bot_check(queue, checker, stop_event, pause_event, context):
     """عامل لفحص اليوزرات (المرحلة الأولى)"""
     while not stop_event.is_set():
         try:
@@ -655,15 +655,18 @@ async def worker_bot_check(queue, checker, stop_event, pause_event):
             if item is None:
                 queue.task_done()
                 break
-            # عناصر طابور المرحلة الأولى تبقى نصاً بسيطاً للاسم
             username = item
-            if username is None:
+            # فلترة سريعة وفق allow/block
+            if not is_username_allowed(context, username):
                 queue.task_done()
-                break
-            # وقت انتظار عشوائي بين الطلبات
-            wait_time = random.uniform(MIN_WAIT_TIME, MAX_WAIT_TIME)
+                continue
+            # وقت انتظار عشوائي ديناميكي
+            runtime = context.user_data.get('runtime', {})
+            min_w = runtime.get('min_wait', MIN_WAIT_TIME)
+            max_w = runtime.get('max_wait', MAX_WAIT_TIME)
+            wait_time = random.uniform(min_w, max_w)
             await asyncio.sleep(wait_time)
-            
+
             await checker.bot_check_username(username)
             queue.task_done()
         except asyncio.TimeoutError:
@@ -689,43 +692,35 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
                 _, _, username = item
             else:
                 username = item
+            # فلترة وفق allow/block كتحقق أخير
+            if not is_username_allowed(context, username):
+                queue.task_done()
+                continue
             account_data = await session_manager.get_account(timeout=60)
             if account_data is None:
                 logger.warning("انتهت مهلة انتظار الحصول على حساب. إعادة المحاولة...")
                 continue
-                
             account_id = account_data['account_id']
             client = account_data['client']
             input_channel = account_data['input_channel']
             phone = account_data['phone']
             claimed = False
             claimer = None
-            account_info = None
-            
             try:
                 session_string = session_manager.get_session_string(client)
                 claimer = AdvancedUsernameClaimer(session_string, session_manager)
                 started = await claimer.start()
                 if not started:
                     continue
-                    
-                # محاولة تثبيت اليوزر
                 claimed, account_info = await claimer.claim_username(input_channel, username)
-                
                 if claimed:
                     async with checker.lock:
                         checker.claimed_usernames.append(username)
-                        
                     if progress_callback:
                         await progress_callback(f"✅ تم تثبيت اليوزر: {username}")
-                    
-                    # إرسال إشعار للمالك
                     try:
-                        # الحصول على معلومات الحساب للإشعار
                         me = await client.get_me()
                         account_username = f"@{me.username}" if me.username else f"+{me.phone}"
-                        
-                        # إنشاء نص الإشعار
                         notification = (
                             f"🎉 **تم تثبيت يوزر جديد بنجاح!**\n\n"
                             f"• اليوزر المحجوز: `{username}`\n"
@@ -733,8 +728,6 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
                             f"• رقم الهاتف: `+{phone}`\n"
                             f"• معرّف الحساب: `{me.id}`"
                         )
-                        
-                        # إرسال الإشعار لكل مسؤول
                         for admin_id in ADMIN_IDS:
                             await context.bot.send_message(
                                 chat_id=admin_id,
@@ -749,22 +742,21 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
             except Exception as e:
                 logger.error(f"خطأ في عامل التثبيت: {e}")
             finally:
-                # تأكد من إعادة الحساب حتى في حالة الخطأ
                 if claimer:
                     try:
                         await claimer.cleanup()
                     except:
                         pass
-                # إعادة الحساب إلى الطابور إذا لم يتم حظره
                 if account_id not in session_manager.banned_accounts:
                     try:
                         await session_manager.release_account(account_id)
                     except:
                         pass
                 queue.task_done()
-                
-                # وقت انتظار عشوائي بين الطلبات
-                wait_time = random.uniform(MIN_WAIT_TIME, MAX_WAIT_TIME)
+                runtime = context.user_data.get('runtime', {})
+                min_w = runtime.get('min_wait', MIN_WAIT_TIME)
+                max_w = runtime.get('max_wait', MAX_WAIT_TIME)
+                wait_time = random.uniform(min_w, max_w)
                 await asyncio.sleep(wait_time)
         except asyncio.TimeoutError:
             if stop_event.is_set():
@@ -773,9 +765,93 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
             break
         except Exception as e:
             logger.error(f"خطأ في عامل التثبيت: {e}")
-            # تأكد من إكمال المهمة حتى في حالة الخطأ
             try:
                 queue.task_done()
+            except:
+                pass
+
+# ============================ أوامر التحكم ============================
+@owner_only
+async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = (update.message.text or '').split()
+    if len(args) < 2:
+        await update.message.reply_text("استخدم: /speed safe|normal|fast")
+        return
+    mode = args[1].lower()
+    if mode not in {"safe", "normal", "fast"}:
+        await update.message.reply_text("الوضع غير صالح. اختر: safe, normal, fast")
+        return
+    num_accounts = len(context.user_data.get('session_manager', SessionManager()).sessions) if context.user_data.get('session_manager') else 0
+    msg = apply_speed_mode(context, mode, num_accounts)
+    await adjust_workers(context)
+    await update.message.reply_text("✅ " + msg)
+
+@owner_only
+async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = (update.message.text or '').split()
+    if len(args) < 2 or not args[1].isdigit():
+        await update.message.reply_text("استخدم: /workers N")
+        return
+    n = max(1, min(20, int(args[1])))
+    num_accounts = len(context.user_data.get('session_manager', SessionManager()).sessions) if context.user_data.get('session_manager') else 0
+    targets = context.user_data.setdefault('runtime_targets', {})
+    targets['phase1'] = n
+    targets['phase2'] = max(1, min(n, num_accounts))
+    context.user_data['mode'] = 'custom'
+    await adjust_workers(context)
+    await update.message.reply_text(f"✅ تم ضبط عدد العمال: مرحلة1={targets['phase1']}، مرحلة2={targets['phase2']}")
+
+@owner_only
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ''
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("استخدم: /block <username|regex>")
+        return
+    pat_text = parts[1].strip().lstrip('@')
+    pat = _compile_pattern(pat_text)
+    lst = context.user_data.setdefault('block_patterns', [])
+    lst.append(pat)
+    await update.message.reply_text(f"✅ تمت إضافة حظر للنمط: {pat_text}")
+
+@owner_only
+async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ''
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("استخدم: /allow <regex>")
+        return
+    pat_text = parts[1].strip().lstrip('@')
+    pat = _compile_pattern(pat_text)
+    lst = context.user_data.setdefault('allow_patterns', [])
+    lst.append(pat)
+    await update.message.reply_text(f"✅ تمت إضافة سماح للنمط: {pat_text}")
+
+@owner_only
+async def cmd_addnames(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ''
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("أرسل الأسماء بعد الأمر: /addnames name1 name2 ... أو مفصولة بسطر/فاصلة.")
+        return
+    valid_set, invalid_count = parse_username_list(parts[1])
+    # تطبيق allow/block
+    filtered = {u for u in valid_set if is_username_allowed(context, u)}
+    before = len(context.user_data.get('extra_usernames_set', set()))
+    context.user_data.setdefault('extra_usernames_set', set()).update(filtered)
+    added = len(context.user_data['extra_usernames_set']) - before
+    await update.message.reply_text(f"✅ تم قبول {added} اسم بعد التصفية. ❌ غير صالح/محجوب: {invalid_count + (len(valid_set)-len(filtered))}")
+    # دفع هذه الأسماء فوراً إلى طابور المرحلة الأولى لتسبق القالب
+    usernames_queue: asyncio.Queue = context.user_data.get('usernames_queue')
+    visited: set = context.user_data.setdefault('visited', set())
+    if usernames_queue:
+        for u in filtered:
+            if u in visited:
+                continue
+            ensure_visited_capacity(visited)
+            visited.add(u)
+            try:
+                await usernames_queue.put(u)
             except:
                 pass
 
@@ -1086,9 +1162,7 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
     try:
         category_id = context.user_data['category_id']
         pattern = context.user_data['pattern']
-        
         if not bot_clients:
-            # تحميل جلسات البوتات للفحص
             bot_clients = []
             for session_string in BOT_SESSIONS:
                 try:
@@ -1099,28 +1173,24 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                 except Exception as e:
                     logger.error(f"فشل تحميل بوت الفحص: {e}")
             context.bot_data['bot_clients'] = bot_clients
-        
-        # تحديث حالة التقدم
         await update_progress(context, 
             f"🔍 <b>جاري بدء عملية الصيد</b>\n\n"
             f"📂 الفئة: {category_id}\n"
             f"🔄 القالب: {pattern}\n"
             f"⏳ جاري تحميل الحسابات..."
         )
-        
-        # تحميل جلسات الحسابات
         session_manager = SessionManager(category_id)
         await session_manager.load_sessions()
         num_accounts = len(session_manager.sessions)
-        
         if num_accounts == 0:
             await update_progress(context, "❌ لا توجد حسابات متاحة في هذه الفئة!")
             return
-        
-        # تخزين مدير الجلسات للوصول من الأوامر
         context.user_data['session_manager'] = session_manager
-        
-        # تحديث حالة التقدم
+        # إعدادات التشغيل الأولية
+        if 'runtime' not in context.user_data:
+            apply_speed_mode(context, context.user_data.get('mode', 'normal'), num_accounts)
+        context.user_data.setdefault('block_patterns', [])
+        context.user_data.setdefault('allow_patterns', [])
         await update_progress(context, 
             f"🚀 <b>بدأت عملية الصيد!</b>\n\n"
             f"📂 الفئة: {category_id}\n"
@@ -1129,28 +1199,32 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             f"🤖 عدد بوتات الفحص: {len(bot_clients)}\n"
             f"⏳ جاري توليد اليوزرات وبدء الفحص..."
         )
-        
-        # توليد اليوزرات
         generator = UsernameGenerator(pattern)
         total_count = 0
-        # طابور المرحلة الأولى يبقى FIFO، لكن سنستخدم backpressure لضبط الإنتاج
         usernames_queue = asyncio.Queue(maxsize=20000)
         checker = UsernameChecker(bot_clients, session_manager)
+        context.user_data['checker'] = checker
         num_workers = min(num_accounts, MAX_CONCURRENT_TASKS)
         async def progress_callback(message):
             await update_progress(context, 
                 f"🚀 <b>جاري عملية الصيد</b>\n\n"
                 f"📂 الفئة: {category_id}\n"
                 f"🔄 القالب: {pattern}\n"
-                f"👥 الحسابات النشطة: {num_workers}\n"
-                f"🤖 بوتات الفحص النشطة: {len(bot_clients)}\n"
+                f"👥 الحسابات النشطة: {len(context.user_data.get('phase2_tasks', []))}\n"
+                f"🤖 بوتات الفحص النشطة: {len(context.user_data.get('phase1_tasks', []))}\n"
                 f"✅ المحجوزة: {len(checker.reserved_usernames)}\n"
                 f"🔄 قيد الفحص (مرحلة 1): {usernames_queue.qsize()} | (مرحلة 2): {checker.available_usernames_queue.qsize()}\n"
                 f"🎯 المحجوزة بنجاح: {len(checker.claimed_usernames)}\n"
                 f"💎 يوزرات Fragment: {len(checker.fragment_usernames)}\n\n"
                 f"📊 {message}"
             )
-        for i in range(num_workers):
+        context.user_data['progress_callback'] = progress_callback
+        # عمال المرحلة الثانية وفق targets الحالية
+        phase2_tasks = []
+        phase1_tasks = []
+        targets = context.user_data.get('runtime_targets', {})
+        target_p2 = int(targets.get('phase2', num_workers))
+        for i in range(target_p2):
             task = asyncio.create_task(
                 worker_account_claim(
                     checker.available_usernames_queue, 
@@ -1162,24 +1236,30 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                     progress_callback
                 )
             )
-            tasks.append(task)
-        for i in range(MAX_CONCURRENT_TASKS):
+            phase2_tasks.append(task)
+        # عمال المرحلة الأولى وفق targets الحالية
+        target_p1 = int(targets.get('phase1', MAX_CONCURRENT_TASKS))
+        for i in range(target_p1):
             task = asyncio.create_task(
-                worker_bot_check(usernames_queue, checker, stop_event, pause_event)
+                worker_bot_check(usernames_queue, checker, stop_event, pause_event, context)
             )
-            tasks.append(task)
+            phase1_tasks.append(task)
+        tasks.extend(phase1_tasks)
+        tasks.extend(phase2_tasks)
+        # تخزين المراجع للتحكم أثناء التشغيل
+        context.user_data['phase1_tasks'] = phase1_tasks
+        context.user_data['phase2_tasks'] = phase2_tasks
+        context.user_data['usernames_queue'] = usernames_queue
         async def generate_usernames():
             nonlocal total_count
             visited: set = context.user_data.setdefault('visited', set())
             extra_usernames: set = context.user_data.get('extra_usernames_set', set())
             count = 0
-            BATCH_SIZE = 1000  # حجم الدفعة الأساسي
+            BATCH_SIZE = 1000
             batch = []
             last_drain = time.time()
             last_total_put = 0
-            
             try:
-                # أولاً: إدراج الأسماء المضافة يدوياً
                 for extra in list(extra_usernames):
                     if stop_event.is_set():
                         break
@@ -1191,13 +1271,13 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                         continue
                     if u in visited:
                         continue
+                    if not is_username_allowed(context, u):
+                        continue
                     ensure_visited_capacity(visited)
                     visited.add(u)
                     await usernames_queue.put(u)
                     count += 1
                     total_count = count
-                
-                # ثانياً: توليد من القالب على دفعات
                 for username in generator.generate_usernames():
                     if stop_event.is_set():
                         break
@@ -1209,20 +1289,29 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                         continue
                     if u in visited:
                         continue
+                    if not is_username_allowed(context, u):
+                        continue
                     batch.append(u)
                     if len(batch) >= BATCH_SIZE:
-                        # دفع الدفعة
                         for u2 in batch:
                             ensure_visited_capacity(visited)
                             visited.add(u2)
                             await usernames_queue.put(u2)
                         count += len(batch)
                         total_count = count
+                        q1 = usernames_queue.qsize()
+                        q2 = checker.available_usernames_queue.qsize()
+                        now = time.time()
+                        drain_rate = max(1.0, (count - last_total_put) / max(0.1, now - last_drain))
+                        if q1 > 15000 or q2 > 3000:
+                            BATCH_SIZE = max(200, int(BATCH_SIZE * 0.7))
+                        elif q1 < 2000 and q2 < 500 and drain_rate > 500:
+                            BATCH_SIZE = min(5000, int(BATCH_SIZE * 1.2))
+                        last_drain = now
+                        last_total_put = count
                         batch = []
                         if count % 10000 == 0:
                             await progress_callback(f"تم توليد {count} يوزر حتى الآن")
-                
-                # إضافة ما تبقى
                 if batch:
                     for u2 in batch:
                         ensure_visited_capacity(visited)
@@ -1230,39 +1319,7 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                         await usernames_queue.put(u2)
                     count += len(batch)
                     total_count = count
-                
-                # إشارات نهاية للعمال
-                for _ in range(MAX_CONCURRENT_TASKS):
-                    if not stop_event.is_set():
-                        await usernames_queue.put(None)
-                # Backpressure: تعديل BATCH_SIZE حسب امتلاء الطوابير وسرعة التفريغ
-                q1 = usernames_queue.qsize()
-                q2 = checker.available_usernames_queue.qsize()
-                now = time.time()
-                drain_rate = max(1.0, (count - last_total_put) / max(0.1, now - last_drain))
-                # إذا امتلأ طابور المرحلة 1 كثيراً وطابور المرحلة 2 كبير، خفض الدفعة
-                if q1 > 15000 or q2 > 3000:
-                    BATCH_SIZE = max(200, int(BATCH_SIZE * 0.7))
-                # إذا كلا الطابورين منخفضين، زد الدفعة تدريجياً
-                elif q1 < 2000 and q2 < 500 and drain_rate > 500:
-                    BATCH_SIZE = min(5000, int(BATCH_SIZE * 1.2))
-                last_drain = now
-                last_total_put = count
-                batch = []
-                if count % 10000 == 0:
-                    await progress_callback(f"تم توليد {count} يوزر حتى الآن")
-                
-                # إضافة ما تبقى
-                if batch:
-                    for u2 in batch:
-                        ensure_visited_capacity(visited)
-                        visited.add(u2)
-                        await usernames_queue.put(u2)
-                    count += len(batch)
-                    total_count = count
-                
-                # إشارات نهاية للعمال
-                for _ in range(MAX_CONCURRENT_TASKS):
+                for _ in range(len(phase1_tasks)):
                     if not stop_event.is_set():
                         await usernames_queue.put(None)
             except asyncio.CancelledError:
@@ -1274,16 +1331,14 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                     count += len(batch)
                 raise
             return count
-        
         gen_task = asyncio.create_task(generate_usernames())
         tasks.append(gen_task)
         await gen_task
         await usernames_queue.join()
         await progress_callback(f"✅ اكتملت المرحلة الأولى: {len(checker.reserved_usernames)} محجوزة")
-        for _ in range(num_workers):
+        for _ in range(len(phase2_tasks)):
             if not stop_event.is_set():
                 await checker.available_usernames_queue.put(None)
-        
         # النتائج النهائية
         result_message = (
             f"🎉 <b>اكتملت عملية الصيد بنجاح!</b>\n\n"
@@ -1440,6 +1495,122 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if update and update.effective_message:
         await update.effective_message.reply_text("❌ حدث خطأ غير متوقع أثناء المعالجة.")
 
+# ============== أدوات مساعدة للمرحلة 3: التحكم أثناء التشغيل ==============
+
+def _compile_pattern(p: str):
+    try:
+        return re.compile(p, re.IGNORECASE)
+    except re.error:
+        # اعتبرها نصاً حرفياً إذا فشل regex
+        escaped = re.escape(p)
+        return re.compile(f"^{escaped}$", re.IGNORECASE)
+
+
+def is_username_allowed(context: ContextTypes.DEFAULT_TYPE, username: str) -> bool:
+    name = username.lstrip('@').lower()
+    block_patterns = context.user_data.get('block_patterns', [])
+    allow_patterns = context.user_data.get('allow_patterns', [])
+    for pat in block_patterns:
+        if pat.search(name):
+            return False
+    if allow_patterns:
+        for pat in allow_patterns:
+            if pat.search(name):
+                return True
+        return False
+    return True
+
+async def adjust_workers(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """تعديل عدد العمال للمرحلتيْن وفق الإعدادات الحالية دون إيقاف المهمة."""
+    async with context.user_data.setdefault('control_lock', asyncio.Lock()):
+        phase1_tasks: list = context.user_data.get('phase1_tasks', [])
+        phase2_tasks: list = context.user_data.get('phase2_tasks', [])
+        stop_event: asyncio.Event = context.user_data.get('stop_event')
+        pause_event: asyncio.Event = context.user_data.get('pause_event')
+        checker: 'UsernameChecker' = context.user_data.get('checker')
+        usernames_queue: asyncio.Queue = context.user_data.get('usernames_queue')
+        session_manager: 'SessionManager' = context.user_data.get('session_manager')
+        bot_clients = context.bot_data.get('bot_clients', [])
+
+        if not all([phase1_tasks is not None, phase2_tasks is not None, stop_event, pause_event, checker, usernames_queue, session_manager]):
+            return
+
+        targets = context.user_data.get('runtime_targets', {})
+        target_p1 = int(targets.get('phase1', len(phase1_tasks)))
+        target_p2 = int(targets.get('phase2', len(phase2_tasks)))
+
+        # ضبط المرحلة 1 (الفحص عبر البوتات)
+        diff_p1 = target_p1 - len(phase1_tasks)
+        if diff_p1 > 0:
+            for _ in range(diff_p1):
+                task = asyncio.create_task(
+                    worker_bot_check(usernames_queue, checker, stop_event, pause_event, context)
+                )
+                phase1_tasks.append(task)
+        elif diff_p1 < 0:
+            # إلغاء بعض العمال
+            for _ in range(-diff_p1):
+                if phase1_tasks:
+                    t = phase1_tasks.pop()
+                    try:
+                        t.cancel()
+                    except:
+                        pass
+
+        # ضبط المرحلة 2 (التثبيت بالحسابات)
+        diff_p2 = target_p2 - len(phase2_tasks)
+        if diff_p2 > 0:
+            for _ in range(diff_p2):
+                task = asyncio.create_task(
+                    worker_account_claim(
+                        checker.available_usernames_queue,
+                        checker,
+                        session_manager,
+                        stop_event,
+                        pause_event,
+                        context,
+                        context.user_data.get('progress_callback')
+                    )
+                )
+                phase2_tasks.append(task)
+        elif diff_p2 < 0:
+            for _ in range(-diff_p2):
+                if phase2_tasks:
+                    t = phase2_tasks.pop()
+                    try:
+                        t.cancel()
+                    except:
+                        pass
+
+        context.user_data['phase1_tasks'] = phase1_tasks
+        context.user_data['phase2_tasks'] = phase2_tasks
+
+
+def apply_speed_mode(context: ContextTypes.DEFAULT_TYPE, mode: str, num_accounts: int) -> str:
+    """تعيين أوضاع السرعة وإرجاع رسالة تأكيد."""
+    mode = mode.lower()
+    runtime = context.user_data.setdefault('runtime', {})
+    targets = context.user_data.setdefault('runtime_targets', {})
+
+    if mode == 'safe':
+        runtime['min_wait'] = 1.2
+        runtime['max_wait'] = 3.0
+        targets['phase1'] = 2
+        targets['phase2'] = max(1, min(2, num_accounts))
+    elif mode == 'fast':
+        runtime['min_wait'] = 0.2
+        runtime['max_wait'] = 1.0
+        targets['phase1'] = 8
+        targets['phase2'] = max(1, min(8, num_accounts))
+    else:  # normal
+        runtime['min_wait'] = 0.5
+        runtime['max_wait'] = 3.0
+        targets['phase1'] = 5
+        targets['phase2'] = max(1, min(5, num_accounts))
+
+    context.user_data['mode'] = mode
+    return f"تم ضبط الوضع إلى {mode}. عمال المرحلة1={targets['phase1']}, المرحلة2={targets['phase2']}, الانتظار={runtime['min_wait']}-{runtime['max_wait']} ثانية."
+
 def main() -> None:
     """تشغيل البوت"""
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1470,11 +1641,21 @@ def main() -> None:
             HUNTING_IN_PROGRESS: [
                 CommandHandler("pause", pause_hunt),
                 CommandHandler("resume", resume_command),
-                CommandHandler("cancel", cancel)
+                CommandHandler("cancel", cancel),
+                CommandHandler("speed", cmd_speed),
+                CommandHandler("workers", cmd_workers),
+                CommandHandler("block", cmd_block),
+                CommandHandler("allow", cmd_allow),
+                CommandHandler("addnames", cmd_addnames),
             ],
             HUNTING_PAUSED: [
                 CommandHandler("resume", resume_command),
-                CommandHandler("cancel", cancel)
+                CommandHandler("cancel", cancel),
+                CommandHandler("speed", cmd_speed),
+                CommandHandler("workers", cmd_workers),
+                CommandHandler("block", cmd_block),
+                CommandHandler("allow", cmd_allow),
+                CommandHandler("addnames", cmd_addnames),
             ]
         },
         fallbacks=[
@@ -1493,6 +1674,12 @@ def main() -> None:
     application.add_handler(CommandHandler("cleanup", cleanup_channels))
     application.add_handler(CommandHandler("pause", pause_hunt))
     application.add_handler(CommandHandler("resume", resume_command))
+    # أوامر التحكم متاحة أيضاً خارج المحادثة عند وجود عملية
+    application.add_handler(CommandHandler("speed", cmd_speed))
+    application.add_handler(CommandHandler("workers", cmd_workers))
+    application.add_handler(CommandHandler("block", cmd_block))
+    application.add_handler(CommandHandler("allow", cmd_allow))
+    application.add_handler(CommandHandler("addnames", cmd_addnames))
     application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
     
