@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: telegram-username-hunter
+    env: python
+    plan: starter
+    buildCommand: "pip install --upgrade pip && pip install -r requirements_enhanced.txt"
+    startCommand: "python User_check.py"
+    envVars:
+      - key: TG_API_ID
+        value: "26924046"
+      - key: TG_API_HASH
+        value: "4c6ef4cee5e129b7a674de156e2bcc15"
+      - key: BOT_TOKEN
+        value: "7941972743:AAFMmZgx2gRBgOaiY4obfhawleO9p1_TYn8"
+      - key: ADMIN_IDS
+        value: "985612253"
+      - key: ENCRYPTION_SALT
+        value: "default_salt"
+      - key: ENCRYPTION_PASSPHRASE
+        value: "default_pass"
+      - key: DISTRIBUTED_MODE
+        value: "0"
+      - key: DB_PATH
+        value: "accounts.db"
+    autoDeploy: true
