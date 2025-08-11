@@ -76,6 +76,9 @@ logger = logging.getLogger(__name__)
 logging.getLogger('telethon').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)  # تقليل تسجيل طلبات HTTP
 
+# عدّاد تسلسلي عالمي لكسر التعادلات في طابور الأولوية
+_SEQ = itertools.count()
+
 # فئات القوالب
 TEMPLATE_TYPES = {
     '١': ('char', 'fixed', string.ascii_uppercase),    # حرف موحد (كبير)
@@ -156,6 +159,39 @@ def parse_username_list(text: str) -> tuple[set, int]:
         else:
             invalid_count += 1
     return valid_set, invalid_count
+
+# ============== أدوات مساعدة للمرحلة 2: التقييم والأولوية ==============
+def score_username(name_no_at: str) -> float:
+    """حساب درجة أولوية للاسم: الأصغر أفضل، بدون '_' أفضل، تنويع الأحرف أفضل،
+    مع عقوبة على التكرارات المتتالية وكثرة الأرقام/الشرطات.
+    قيمة أصغر تعني أولوية أعلى.
+    """
+    n = name_no_at.lower()
+    length = len(n)
+    underscore_count = n.count('_')
+    digit_count = sum(c.isdigit() for c in n)
+    # عقوبة التكرار المتتالي
+    consecutive_penalty = 0
+    for i in range(1, length):
+        if n[i] == n[i-1]:
+            consecutive_penalty += 0.5
+    # مكافأة تنويع الأحرف
+    unique_chars = len(set(n))
+    diversity_bonus = min(2.0, unique_chars / max(1, length) * 2.0)  # 0..2
+    # عقوبة كثرة الأرقام
+    digit_ratio = digit_count / max(1, length)
+    digit_penalty = 0.5 if digit_ratio > 0.6 else 0.0
+    # عقوبة الشرطة السفلية الكثيرة
+    underscore_penalty = 0.3 * underscore_count
+    # المعادلة النهائية
+    score = (
+        length
+        + consecutive_penalty
+        + digit_penalty
+        + underscore_penalty
+        - diversity_bonus
+    )
+    return round(score, 4)
 
 # ============================ ديكورات التحقق ============================
 def owner_only(func):
@@ -498,7 +534,8 @@ class UsernameChecker:
         self.session_manager = session_manager
         self.current_bot_index = 0
         self.reserved_usernames = []
-        self.available_usernames_queue = asyncio.Queue()
+        # طابور أولوية للأسماء المتاحة للتثبيت: (score, seq, username)
+        self.available_usernames_queue = asyncio.PriorityQueue()
         self.claimed_usernames = []
         self.fragment_usernames = []
         self.lock = asyncio.Lock()
@@ -567,7 +604,11 @@ class UsernameChecker:
                 logger.info(f"اليوزر محجوز: {username}")
                 return "reserved"
             except (UsernameInvalidError, ValueError):
-                await self.available_usernames_queue.put(username)
+                # حساب الدرجة وإدراج في طابور الأولوية
+                name_no_at = username.lstrip('@')
+                score = score_username(name_no_at)
+                seq = next(_SEQ)
+                await self.available_usernames_queue.put((score, seq, username))
                 logger.info(f"تم تمرير اليوزر للمرحلة الثانية: {username}")
                 return "available"
             except UsernamePurchaseAvailableError:
@@ -607,16 +648,18 @@ async def worker_bot_check(queue, checker, stop_event, pause_event):
     """عامل لفحص اليوزرات (المرحلة الأولى)"""
     while not stop_event.is_set():
         try:
-            # التحقق من حالة الإيقاف المؤقت
             if pause_event.is_set():
                 await asyncio.sleep(1)
                 continue
-                
-            username = await asyncio.wait_for(queue.get(), timeout=1.0)
+            item = await asyncio.wait_for(queue.get(), timeout=1.0)
+            if item is None:
+                queue.task_done()
+                break
+            # عناصر طابور المرحلة الأولى تبقى نصاً بسيطاً للاسم
+            username = item
             if username is None:
                 queue.task_done()
                 break
-                
             # وقت انتظار عشوائي بين الطلبات
             wait_time = random.uniform(MIN_WAIT_TIME, MAX_WAIT_TIME)
             await asyncio.sleep(wait_time)
@@ -635,16 +678,17 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
     """عامل لتثبيت اليوزرات بالحسابات (المرحلة الثانية) مع إرسال إشعارات"""
     while not stop_event.is_set():
         try:
-            # التحقق من حالة الإيقاف المؤقت
             if pause_event.is_set():
                 await asyncio.sleep(1)
                 continue
-                
-            username = await asyncio.wait_for(queue.get(), timeout=1.0)
-            if username is None:
+            item = await asyncio.wait_for(queue.get(), timeout=1.0)
+            if item is None:
                 queue.task_done()
                 break
-                
+            if isinstance(item, tuple) and len(item) == 3:
+                _, _, username = item
+            else:
+                username = item
             account_data = await session_manager.get_account(timeout=60)
             if account_data is None:
                 logger.warning("انتهت مهلة انتظار الحصول على حساب. إعادة المحاولة...")
@@ -1037,11 +1081,8 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
     stop_event = asyncio.Event()
     pause_event = asyncio.Event()
     tasks = []
-    
-    # تخزين أحداث التحكم في السياق للوصول من الأوامر
     context.user_data['stop_event'] = stop_event
     context.user_data['pause_event'] = pause_event
-    
     try:
         category_id = context.user_data['category_id']
         pattern = context.user_data['pattern']
@@ -1092,15 +1133,10 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
         # توليد اليوزرات
         generator = UsernameGenerator(pattern)
         total_count = 0
-        usernames_queue = asyncio.Queue(maxsize=10000)
-        
-        # إنشاء نظام الفحص
+        # طابور المرحلة الأولى يبقى FIFO، لكن سنستخدم backpressure لضبط الإنتاج
+        usernames_queue = asyncio.Queue(maxsize=20000)
         checker = UsernameChecker(bot_clients, session_manager)
-        
-        # بدء عمال المرحلة الثانية (الحسابات)
         num_workers = min(num_accounts, MAX_CONCURRENT_TASKS)
-        
-        # دالة لتحديث التقدم
         async def progress_callback(message):
             await update_progress(context, 
                 f"🚀 <b>جاري عملية الصيد</b>\n\n"
@@ -1109,13 +1145,11 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                 f"👥 الحسابات النشطة: {num_workers}\n"
                 f"🤖 بوتات الفحص النشطة: {len(bot_clients)}\n"
                 f"✅ المحجوزة: {len(checker.reserved_usernames)}\n"
-                f"🔄 قيد الفحص: {usernames_queue.qsize()}\n"
+                f"🔄 قيد الفحص (مرحلة 1): {usernames_queue.qsize()} | (مرحلة 2): {checker.available_usernames_queue.qsize()}\n"
                 f"🎯 المحجوزة بنجاح: {len(checker.claimed_usernames)}\n"
                 f"💎 يوزرات Fragment: {len(checker.fragment_usernames)}\n\n"
                 f"📊 {message}"
             )
-        
-        # إنشاء عمال التثبيت (المرحلة الثانية)
         for i in range(num_workers):
             task = asyncio.create_task(
                 worker_account_claim(
@@ -1129,22 +1163,20 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                 )
             )
             tasks.append(task)
-        
-        # إنشاء عمال فحص البوت (المرحلة الأولى)
         for i in range(MAX_CONCURRENT_TASKS):
             task = asyncio.create_task(
                 worker_bot_check(usernames_queue, checker, stop_event, pause_event)
             )
             tasks.append(task)
-        
-        # مهمة لتوليد اليوزرات باستخدام الدفعات + دمج القائمة اليدوية + منع التكرار
         async def generate_usernames():
             nonlocal total_count
             visited: set = context.user_data.setdefault('visited', set())
             extra_usernames: set = context.user_data.get('extra_usernames_set', set())
             count = 0
-            BATCH_SIZE = 1000  # حجم الدفعة
+            BATCH_SIZE = 1000  # حجم الدفعة الأساسي
             batch = []
+            last_drain = time.time()
+            last_total_put = 0
             
             try:
                 # أولاً: إدراج الأسماء المضافة يدوياً
@@ -1179,6 +1211,7 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                         continue
                     batch.append(u)
                     if len(batch) >= BATCH_SIZE:
+                        # دفع الدفعة
                         for u2 in batch:
                             ensure_visited_capacity(visited)
                             visited.add(u2)
@@ -1202,8 +1235,37 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                 for _ in range(MAX_CONCURRENT_TASKS):
                     if not stop_event.is_set():
                         await usernames_queue.put(None)
+                # Backpressure: تعديل BATCH_SIZE حسب امتلاء الطوابير وسرعة التفريغ
+                q1 = usernames_queue.qsize()
+                q2 = checker.available_usernames_queue.qsize()
+                now = time.time()
+                drain_rate = max(1.0, (count - last_total_put) / max(0.1, now - last_drain))
+                # إذا امتلأ طابور المرحلة 1 كثيراً وطابور المرحلة 2 كبير، خفض الدفعة
+                if q1 > 15000 or q2 > 3000:
+                    BATCH_SIZE = max(200, int(BATCH_SIZE * 0.7))
+                # إذا كلا الطابورين منخفضين، زد الدفعة تدريجياً
+                elif q1 < 2000 and q2 < 500 and drain_rate > 500:
+                    BATCH_SIZE = min(5000, int(BATCH_SIZE * 1.2))
+                last_drain = now
+                last_total_put = count
+                batch = []
+                if count % 10000 == 0:
+                    await progress_callback(f"تم توليد {count} يوزر حتى الآن")
+                
+                # إضافة ما تبقى
+                if batch:
+                    for u2 in batch:
+                        ensure_visited_capacity(visited)
+                        visited.add(u2)
+                        await usernames_queue.put(u2)
+                    count += len(batch)
+                    total_count = count
+                
+                # إشارات نهاية للعمال
+                for _ in range(MAX_CONCURRENT_TASKS):
+                    if not stop_event.is_set():
+                        await usernames_queue.put(None)
             except asyncio.CancelledError:
-                # إضافة ما تبقى في حالة الإلغاء
                 if batch:
                     for u2 in batch:
                         ensure_visited_capacity(visited)
@@ -1215,15 +1277,9 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
         
         gen_task = asyncio.create_task(generate_usernames())
         tasks.append(gen_task)
-        
-        # انتظار انتهاء التوليد والفحص الأولي
         await gen_task
         await usernames_queue.join()
-        
-        # تحديث حالة التقدم
         await progress_callback(f"✅ اكتملت المرحلة الأولى: {len(checker.reserved_usernames)} محجوزة")
-        
-        # انتظار انتهاء المرحلة الثانية
         for _ in range(num_workers):
             if not stop_event.is_set():
                 await checker.available_usernames_queue.put(None)
