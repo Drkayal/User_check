@@ -2192,6 +2192,108 @@ def load_items_for_resume(run_id: int) -> tuple[list[tuple[float,int,str]], list
         logger.error(f"load_items_for_resume error: {e}")
         return pending, available, visited
 
+# سياق خفيف للمهام المتوازية لعزل user_data
+class RuntimeContext:
+    def __init__(self, bot, user_data: dict):
+        self.bot = bot
+        self.user_data = user_data
+
+# ============================ أوامر وإدارة المهام المتوازية ============================
+@owner_only
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hunts = context.bot_data.setdefault('hunts', {})
+    if not hunts:
+        await update.message.reply_text("لا توجد مهام نشطة.")
+        return
+    lines = []
+    keyboard = []
+    for run_id, meta in hunts.items():
+        status = meta.get('status', 'unknown')
+        pattern = meta.get('pattern', '-')
+        category_id = meta.get('category_id', '-')
+        lines.append(f"• #{run_id} — {status} — cat:{category_id} — pattern:{pattern}")
+        keyboard.append([
+            InlineKeyboardButton(f"#{run_id} حالة", callback_data=f"task_{run_id}_status"),
+            InlineKeyboardButton("⏸", callback_data=f"task_{run_id}_pause"),
+            InlineKeyboardButton("▶️", callback_data=f"task_{run_id}_resume"),
+            InlineKeyboardButton("🛑", callback_data=f"task_{run_id}_cancel"),
+        ])
+    await update.message.reply_text("المهام النشطة:\n" + "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+@owner_only
+async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = (update.message.text or '').split()
+    if len(parts) < 3:
+        await update.message.reply_text("استخدم: /task <run_id> <status|pause|resume|cancel>")
+        return
+    try:
+        run_id = int(parts[1])
+    except:
+        await update.message.reply_text("معرّف المهمة غير صالح.")
+        return
+    action = parts[2].lower()
+    return await handle_task_action(update, context, run_id, action)
+
+async def handle_task_action(update_or_query, context: ContextTypes.DEFAULT_TYPE, run_id: int, action: str):
+    hunts = context.bot_data.setdefault('hunts', {})
+    if run_id not in hunts:
+        if isinstance(update_or_query, Update) and update_or_query.callback_query:
+            await update_or_query.callback_query.edit_message_text("❌ لم يتم العثور على المهمة.")
+        else:
+            await update_or_query.message.reply_text("❌ لم يتم العثور على المهمة.")
+        return
+    meta = hunts[run_id]
+    tctx: RuntimeContext = meta.get('tctx')
+    if not tctx:
+        await (update_or_query.callback_query.edit_message_text if update_or_query.callback_query else update_or_query.message.reply_text)("❌ المهمة غير مهيأة.")
+        return
+    stop_event: asyncio.Event = tctx.user_data.get('stop_event')
+    pause_event: asyncio.Event = tctx.user_data.get('pause_event')
+    checker = tctx.user_data.get('checker')
+    usernames_queue = tctx.user_data.get('usernames_queue')
+    if action == 'status':
+        p1 = usernames_queue.qsize() if usernames_queue else 0
+        p2 = checker.available_usernames_queue.qsize() if checker else 0
+        msg = (
+            f"📌 مهمة #{run_id}:\n"
+            f"• الحالة: {meta.get('status','unknown')}\n"
+            f"• طوابير المرحلة1/2: {p1}/{p2}\n"
+            f"• عمال المرحلة1/2: {len(tctx.user_data.get('phase1_tasks', []))}/{len(tctx.user_data.get('phase2_tasks', []))}"
+        )
+        if update_or_query.callback_query:
+            await update_or_query.callback_query.edit_message_text(msg)
+        else:
+            await update_or_query.message.reply_text(msg)
+    elif action == 'pause':
+        if pause_event and not pause_event.is_set():
+            pause_event.set()
+        meta['status'] = HUNT_STATUS_PAUSED
+        await (update_or_query.callback_query.edit_message_text if update_or_query.callback_query else update_or_query.message.reply_text)(f"⏸ تم إيقاف المهمة #{run_id} مؤقتاً")
+    elif action == 'resume':
+        if pause_event and pause_event.is_set():
+            pause_event.clear()
+        meta['status'] = HUNT_STATUS_RUNNING
+        await (update_or_query.callback_query.edit_message_text if update_or_query.callback_query else update_or_query.message.reply_text)(f"▶️ تم استئناف المهمة #{run_id}")
+    elif action == 'cancel':
+        if stop_event and not stop_event.is_set():
+            stop_event.set()
+        meta['status'] = HUNT_STATUS_FINISHED
+        await (update_or_query.callback_query.edit_message_text if update_or_query.callback_query else update_or_query.message.reply_text)(f"🛑 تم إلغاء المهمة #{run_id}")
+    else:
+        await (update_or_query.callback_query.edit_message_text if update_or_query.callback_query else update_or_query.message.reply_text)("❌ إجراء غير معروف")
+
+@owner_only
+async def task_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    m = re.match(r"^task_(\d+)_(status|pause|resume|cancel)$", q.data)
+    if not m:
+        await q.edit_message_text("❌ طلب غير صالح")
+        return
+    run_id = int(m.group(1))
+    action = m.group(2)
+    await handle_task_action(update, context, run_id, action)
+
 def main() -> None:
     """تشغيل البوت"""
     application = Application.builder().token(BOT_TOKEN).build()
@@ -2263,7 +2365,9 @@ def main() -> None:
     application.add_handler(CommandHandler("allow", cmd_allow))
     application.add_handler(CommandHandler("addnames", cmd_addnames))
     application.add_handler(CommandHandler("report", report_command))
-    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("tasks", list_tasks))
+    application.add_handler(CommandHandler("task", task_command))
+    application.add_handler(CallbackQueryHandler(task_callback_handler, pattern=r"^task_\d+_(status|pause|resume|cancel)$"))
     application.add_error_handler(error_handler)
     
     # بدء البوت
