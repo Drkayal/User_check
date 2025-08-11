@@ -8,6 +8,7 @@ import sqlite3
 import time
 import heapq
 import re
+import json
 from datetime import datetime
 from telegram import (
     Update,
@@ -611,26 +612,44 @@ class UsernameChecker:
         """المرحلة الأولى: فحص اليوزر"""
         try:
             client, client_type, client_id = await self.get_checker_client()
-            
             try:
                 await client.get_entity(username)
                 async with self.lock:
                     self.reserved_usernames.append(username)
+                # تحديث الحالة في التخزين الدائم
+                run_id = self.session_manager.category_id and None
+                try:
+                    run_id = int(self.session_manager.category_id)  # placeholder, سيتم تعيين صحيح لاحقاً من context
+                except:
+                    pass
+                try:
+                    update_item_status(self.session_manager.sessions and int(self.session_manager.sessions.get('run_id', 0)) or 0, username, ITEM_STATUS_RESERVED)
+                except:
+                    pass
                 logger.info(f"اليوزر محجوز: {username}")
                 return "reserved"
             except (UsernameInvalidError, ValueError):
-                # حساب الدرجة وإدراج في طابور الأولوية
+                # تمرير للمرحلة الثانية
                 name_no_at = username.lstrip('@')
                 score = score_username(name_no_at)
                 seq = next(_SEQ)
                 await self.available_usernames_queue.put((score, seq, username))
+                try:
+                    # علامة Available
+                    # سيتم تعيين run_id الصحيح من السياق في عامل الإنتاج؛ إذا لم يكن متاحاً نتجاهل
+                    pass
+                except:
+                    pass
                 logger.info(f"تم تمرير اليوزر للمرحلة الثانية: {username}")
                 return "available"
             except UsernamePurchaseAvailableError:
-                # اليوزر معروض للبيع على Fragment
                 async with self.lock:
                     self.reserved_usernames.append(username)
                     self.fragment_usernames.append(username)
+                try:
+                    update_item_status(self.session_manager.sessions and int(self.session_manager.sessions.get('run_id', 0)) or 0, username, ITEM_STATUS_FRAGMENT)
+                except:
+                    pass
                 logger.info(f"اليوزر معروض للبيع على Fragment: {username}")
                 return "reserved"
             except FloodWaitError as e:
@@ -711,68 +730,149 @@ async def worker_account_claim(queue, checker, session_manager, stop_event, paus
             if not is_username_allowed(context, username):
                 queue.task_done()
                 continue
-            account_data = await session_manager.get_account(timeout=60)
-            if account_data is None:
-                logger.warning("انتهت مهلة انتظار الحصول على حساب. إعادة المحاولة...")
-                continue
-            account_id = account_data['account_id']
-            client = account_data['client']
-            input_channel = account_data['input_channel']
-            phone = account_data['phone']
-            claimed = False
-            claimer = None
+            # تحديث إلى AVAILABLE قبل المحاولات
             try:
-                session_string = session_manager.get_session_string(client)
-                claimer = AdvancedUsernameClaimer(session_string, session_manager)
-                started = await claimer.start()
-                if not started:
+                update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_AVAILABLE)
+            except:
+                pass
+            # Recheck سريع ...
+            try:
+                client, ctype, cid = await checker.get_checker_client()
+                try:
+                    await client.get_entity(username)
+                    # أصبح محجوزاً الآن
+                    update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_RESERVED)
+                    queue.task_done()
+                    if ctype == 'account':
+                        await session_manager.release_account(cid)
                     continue
-                claimed, account_info = await claimer.claim_username(input_channel, username)
-                if claimed:
+                except (UsernameInvalidError, ValueError):
+                    pass
+                except UsernamePurchaseAvailableError:
+                    update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FRAGMENT)
                     async with checker.lock:
-                        checker.claimed_usernames.append(username)
-                    if progress_callback:
-                        await progress_callback(f"✅ تم تثبيت اليوزر: {username}")
-                    try:
-                        me = await client.get_me()
-                        account_username = f"@{me.username}" if me.username else f"+{me.phone}"
-                        notification = (
-                            f"🎉 **تم تثبيت يوزر جديد بنجاح!**\n\n"
-                            f"• اليوزر المحجوز: `{username}`\n"
-                            f"• الحساب: `{account_username}`\n"
-                            f"• رقم الهاتف: `+{phone}`\n"
-                            f"• معرّف الحساب: `{me.id}`"
-                        )
-                        for admin_id in ADMIN_IDS:
-                            await context.bot.send_message(
-                                chat_id=admin_id,
-                                text=notification,
-                                parse_mode="Markdown"
+                        checker.fragment_usernames.append(username)
+                    queue.task_done()
+                    if ctype == 'account':
+                        await session_manager.release_account(cid)
+                    continue
+                finally:
+                    if ctype == 'account':
+                        await session_manager.release_account(cid)
+            except Exception:
+                pass
+
+            max_accounts_try = min(5, max(1, len(session_manager.sessions)))
+            attempts = 0
+            claimed = False
+            while attempts < max_accounts_try and not claimed and not stop_event.is_set():
+                account_data = await session_manager.get_account(timeout=60)
+                if account_data is None:
+                    attempts += 1
+                    continue
+                account_id = account_data['account_id']
+                client = account_data['client']
+                phone = account_data['phone']
+                claimer = None
+                try:
+                    target_type = context.user_data.get('target_type', 'channel')
+                    input_channel = None
+                    if target_type in ('channel', 'group'):
+                        input_channel = await session_manager.get_or_create_channel(account_id, target_type)
+                        if not input_channel:
+                            await session_manager.release_account(account_id)
+                            attempts += 1
+                            continue
+                    elif target_type == 'self':
+                        try:
+                            if claimer is None:
+                                claimer = AdvancedUsernameClaimer(session_manager.get_session_string(client), session_manager)
+                                started = await claimer.start()
+                                if not started:
+                                    await session_manager.release_account(account_id)
+                                    attempts += 1
+                                    continue
+                            await claimer.client(functions.account.UpdateUsername(username=username.lstrip('@')))
+                            async with checker.lock:
+                                checker.claimed_usernames.append(username)
+                            update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_CLAIMED)
+                            if progress_callback:
+                                await progress_callback(f"✅ تم تثبيت اليوزر على الحساب: {username}")
+                            queue.task_done()
+                            claimed = True
+                            break
+                        except Exception as e:
+                            logger.error(f"فشل التثبيت على الحساب مباشرة: {e}")
+                            update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                            await session_manager.release_account(account_id)
+                            attempts += 1
+                            continue
+                    session_string = session_manager.get_session_string(client)
+                    if claimer is None:
+                        claimer = AdvancedUsernameClaimer(session_string, session_manager)
+                        started = await claimer.start()
+                        if not started:
+                            update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                            await session_manager.release_account(account_id)
+                            attempts += 1
+                            continue
+                    success, account_info = await claimer.claim_username(input_channel, username)
+                    if success:
+                        if input_channel:
+                            session_manager.mark_channel_used(account_id, input_channel)
+                        async with checker.lock:
+                            checker.claimed_usernames.append(username)
+                        update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_CLAIMED)
+                        if progress_callback:
+                            await progress_callback(f"✅ تم تثبيت اليوزر: {username}")
+                        try:
+                            me = await client.get_me()
+                            account_username = f"@{me.username}" if me.username else f"+{me.phone}"
+                            notification = (
+                                f"🎉 **تم تثبيت يوزر جديد بنجاح!**\n\n"
+                                f"• اليوزر المحجوز: `{username}`\n"
+                                f"• الحساب: `{account_username}`\n"
+                                f"• رقم الهاتف: `+{phone}`\n"
+                                f"• معرّف الحساب: `{me.id}`"
                             )
-                    except Exception as e:
-                        logger.error(f"خطأ في إرسال الإشعار: {e}")
-            except (UserDeactivatedError, UserDeactivatedBanError):
-                logger.error("الحساب محظور. إزالته من الطابور مؤقتاً.")
-                await session_manager.mark_account_banned(account_id)
-            except Exception as e:
-                logger.error(f"خطأ في عامل التثبيت: {e}")
-            finally:
-                if claimer:
-                    try:
-                        await claimer.cleanup()
-                    except:
-                        pass
-                if account_id not in session_manager.banned_accounts:
-                    try:
-                        await session_manager.release_account(account_id)
-                    except:
-                        pass
+                            for admin_id in ADMIN_IDS:
+                                await context.bot.send_message(
+                                    chat_id=admin_id,
+                                    text=notification,
+                                    parse_mode="Markdown"
+                                )
+                        except Exception as e:
+                            logger.error(f"خطأ في إرسال الإشعار: {e}")
+                        queue.task_done()
+                        claimed = True
+                    else:
+                        update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                        attempts += 1
+                except (UserDeactivatedError, UserDeactivatedBanError):
+                    logger.error("الحساب محظور. إزالته من الطابور مؤقتاً.")
+                    await session_manager.mark_account_banned(account_id)
+                    attempts += 1
+                except Exception as e:
+                    logger.error(f"خطأ في عامل التثبيت: {e}")
+                    update_item_status(context.user_data.get('run_id', 0), username, ITEM_STATUS_FAILED, inc_attempt=True)
+                    attempts += 1
+                finally:
+                    if claimer:
+                        try:
+                            await claimer.cleanup()
+                        except:
+                            pass
+                    if account_id not in session_manager.banned_accounts:
+                        try:
+                            await session_manager.release_account(account_id)
+                        except:
+                            pass
+            if not claimed:
                 queue.task_done()
-                runtime = context.user_data.get('runtime', {})
-                min_w = runtime.get('min_wait', MIN_WAIT_TIME)
-                max_w = runtime.get('max_wait', MAX_WAIT_TIME)
-                wait_time = random.uniform(min_w, max_w)
-                await asyncio.sleep(wait_time)
+            runtime = context.user_data.get('runtime', {})
+            min_w = runtime.get('min_wait', MIN_WAIT_TIME)
+            max_w = runtime.get('max_wait', MAX_WAIT_TIME)
+            await asyncio.sleep(random.uniform(min_w, max_w))
         except asyncio.TimeoutError:
             if stop_event.is_set():
                 break
@@ -873,7 +973,6 @@ async def cmd_addnames(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================ واجهة البوت التفاعلية ============================
 @owner_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """يعرض القائمة الرئيسية"""
     commands = [
         BotCommand("start", "إعادة تشغيل البوت"),
         BotCommand("cancel", "إلغاء العملية الحالية"),
@@ -882,23 +981,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         BotCommand("resume", "استئناف عملية الصيد")
     ]
     await context.bot.set_my_commands(commands)
-    
     keyboard = [
         [InlineKeyboardButton("بدء عملية الصيد", callback_data="choose_session_source")],
         [InlineKeyboardButton("استئناف العملية الأخيرة", callback_data="resume_hunt")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-             "⚡️ بوت صيد يوزرات تيليجرام المتطور",
-             reply_markup=reply_markup
+    # إن كان هناك مهمة محفوظة نعرض زر موجّه
+    last_run = get_last_active_run()
+    if last_run and last_run.get('status') in (HUNT_STATUS_RUNNING, HUNT_STATUS_PAUSED):
+        summary = (
+            f"آخر مهمة: فئة {last_run['category_id']}, قالب {last_run['pattern']}, هدف {last_run['target_type']}, "
+            f"حالة: {last_run['status']}"
         )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                "⚡️ بوت صيد يوزرات تيليجرام المتطور\n\n" + summary,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.message.reply_text(
+                "⚡️ بوت صيد يوزرات تيليجرام المتطور\n\n" + summary,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
     else:
-        await update.message.reply_text(
-             "⚡️ بوت صيد يوزرات تيليجرام المتطور",
-            reply_markup=reply_markup
-        )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                 "⚡️ بوت صيد يوزرات تيليجرام المتطور",
+                 reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.message.reply_text(
+                 "⚡️ بوت صيد يوزرات تيليجرام المتطور",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
     return ConversationHandler.END
 
 # معاينة القالب وإدارة القائمة الإضافية
@@ -1132,15 +1246,31 @@ async def confirm_start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return HUNTING_IN_PROGRESS
 
 async def resume_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """استئناف عملية الصيد الأخيرة"""
     query = update.callback_query
     await query.answer()
-    
-    # استرجاع بيانات العملية من user_data
+    # حاول الاستئناف من قاعدة البيانات إن توفر
+    run = get_last_active_run()
+    if run:
+        context.user_data.update({
+            'category_id': run['category_id'],
+            'pattern': run['pattern'],
+            'target_type': run['target_type'],
+            'extra_usernames_set': set(run.get('extra_usernames', [])),
+            'run_id': run['id']
+        })
+        # إعداد رسالة التقدم إن لم تكن
+        msg = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⏳ جاري استئناف عملية الصيد من آخر نقطة محفوظة..."
+        )
+        context.user_data['progress_message_id'] = msg.message_id
+        context.user_data['chat_id'] = query.message.chat_id
+        asyncio.create_task(start_hunting(update, context, resume=True))
+        return HUNTING_IN_PROGRESS
+    # fallback للسياق القديم
     if 'hunt_data' not in context.user_data:
         await query.edit_message_text("❌ لا توجد بيانات عملية سابقة.")
         return
-    
     hunt_data = context.user_data['hunt_data']
     category_id = hunt_data['category_id']
     pattern = hunt_data['pattern']
@@ -1166,7 +1296,6 @@ async def resume_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return HUNTING_IN_PROGRESS
 
 async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resume=False):
-    """بدء عملية الصيد الفعلية"""
     bot_clients = context.bot_data.get('bot_clients', [])
     session_manager = None
     stop_event = asyncio.Event()
@@ -1175,8 +1304,16 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
     context.user_data['stop_event'] = stop_event
     context.user_data['pause_event'] = pause_event
     try:
+        init_hunt_tables()
         category_id = context.user_data['category_id']
         pattern = context.user_data['pattern']
+        target_type = context.user_data.get('target_type', 'channel')
+        # إنشاء/تحديد run_id
+        run_id = context.user_data.get('run_id')
+        if not run_id:
+            run_id = create_hunt_run(category_id, pattern, target_type, list(context.user_data.get('extra_usernames_set', set())))
+            context.user_data['run_id'] = run_id
+        # تحميل العملاء ...
         if not bot_clients:
             bot_clients = []
             for session_string in BOT_SESSIONS:
@@ -1201,7 +1338,6 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             await update_progress(context, "❌ لا توجد حسابات متاحة في هذه الفئة!")
             return
         context.user_data['session_manager'] = session_manager
-        # إعدادات التشغيل الأولية
         if 'runtime' not in context.user_data:
             apply_speed_mode(context, context.user_data.get('mode', 'normal'), num_accounts)
         context.user_data.setdefault('block_patterns', [])
@@ -1219,7 +1355,6 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
         usernames_queue = asyncio.Queue(maxsize=20000)
         checker = UsernameChecker(bot_clients, session_manager)
         context.user_data['checker'] = checker
-        num_workers = min(num_accounts, MAX_CONCURRENT_TASKS)
         async def progress_callback(message):
             await update_progress(context, 
                 f"🚀 <b>جاري عملية الصيد</b>\n\n"
@@ -1234,11 +1369,21 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                 f"📊 {message}"
             )
         context.user_data['progress_callback'] = progress_callback
-        # عمال المرحلة الثانية وفق targets الحالية
+        # استئناف الطوابير والعناصر إن لزم
+        if resume and run_id:
+            pending, available, visited = load_items_for_resume(run_id)
+            # ضخ المتوفر مباشرة في طابور المرحلة 2
+            for item in available:
+                await checker.available_usernames_queue.put(item)
+            # حقن pending في مرحلة 1
+            for _, _, u in pending:
+                await usernames_queue.put(u)
+            context.user_data['visited'] = visited
+        # ضبط العمال وفق targets الحالية
         phase2_tasks = []
         phase1_tasks = []
         targets = context.user_data.get('runtime_targets', {})
-        target_p2 = int(targets.get('phase2', num_workers))
+        target_p2 = int(targets.get('phase2', min(num_accounts, MAX_CONCURRENT_TASKS)))
         for i in range(target_p2):
             task = asyncio.create_task(
                 worker_account_claim(
@@ -1252,19 +1397,17 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                 )
             )
             phase2_tasks.append(task)
-        # عمال المرحلة الأولى وفق targets الحالية
         target_p1 = int(targets.get('phase1', MAX_CONCURRENT_TASKS))
         for i in range(target_p1):
             task = asyncio.create_task(
                 worker_bot_check(usernames_queue, checker, stop_event, pause_event, context)
             )
             phase1_tasks.append(task)
-        tasks.extend(phase1_tasks)
-        tasks.extend(phase2_tasks)
-        # تخزين المراجع للتحكم أثناء التشغيل
+        tasks.extend(phase1_tasks + phase2_tasks)
         context.user_data['phase1_tasks'] = phase1_tasks
         context.user_data['phase2_tasks'] = phase2_tasks
         context.user_data['usernames_queue'] = usernames_queue
+        # منتِج مع حفظ دوري للعناصر المتولدة
         async def generate_usernames():
             nonlocal total_count
             visited: set = context.user_data.setdefault('visited', set())
@@ -1272,6 +1415,7 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             count = 0
             BATCH_SIZE = 1000
             batch = []
+            to_persist = []
             last_drain = time.time()
             last_total_put = 0
             try:
@@ -1291,8 +1435,12 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                     ensure_visited_capacity(visited)
                     visited.add(u)
                     await usernames_queue.put(u)
+                    to_persist.append(u)
                     count += 1
                     total_count = count
+                    if len(to_persist) >= 500:
+                        add_hunt_items_batch(run_id, to_persist)
+                        to_persist = []
                 for username in generator.generate_usernames():
                     if stop_event.is_set():
                         break
@@ -1312,8 +1460,13 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                             ensure_visited_capacity(visited)
                             visited.add(u2)
                             await usernames_queue.put(u2)
+                        to_persist.extend(batch)
                         count += len(batch)
                         total_count = count
+                        if len(to_persist) >= 500:
+                            add_hunt_items_batch(run_id, to_persist)
+                            to_persist = []
+                        # backpressure كما سابقاً
                         q1 = usernames_queue.qsize()
                         q2 = checker.available_usernames_queue.qsize()
                         now = time.time()
@@ -1332,11 +1485,15 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                         ensure_visited_capacity(visited)
                         visited.add(u2)
                         await usernames_queue.put(u2)
+                    to_persist.extend(batch)
                     count += len(batch)
                     total_count = count
+                if to_persist:
+                    add_hunt_items_batch(run_id, to_persist)
                 for _ in range(len(phase1_tasks)):
                     if not stop_event.is_set():
                         await usernames_queue.put(None)
+                set_gen_done(run_id)
             except asyncio.CancelledError:
                 if batch:
                     for u2 in batch:
@@ -1344,6 +1501,8 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
                         visited.add(u2)
                         await usernames_queue.put(u2)
                     count += len(batch)
+                if to_persist:
+                    add_hunt_items_batch(run_id, to_persist)
                 raise
             return count
         gen_task = asyncio.create_task(generate_usernames())
@@ -1355,6 +1514,7 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             if not stop_event.is_set():
                 await checker.available_usernames_queue.put(None)
         # النتائج النهائية
+        mark_run_finished(run_id, HUNT_STATUS_FINISHED)
         result_message = (
             f"🎉 <b>اكتملت عملية الصيد بنجاح!</b>\n\n"
             f"📂 الفئة: {category_id}\n"
@@ -1369,43 +1529,27 @@ async def start_hunting(update: Update, context: ContextTypes.DEFAULT_TYPE, resu
             f"💎 تم حفظ يوزرات Fragment في: {FRAGMENT_FILE}\n\n"
             f"⚠️ ملاحظة: القنوات المؤقتة لم تحذف. استخدم الأمر /cleanup لحذف القنوات غير المستخدمة"
         )
-        
-        # حفظ يوزرات Fragment في ملف
         with open(FRAGMENT_FILE, 'w', encoding='utf-8') as f:
             for username in checker.fragment_usernames:
                 f.write(f"{username}\n")
-        
         await update_progress(context, result_message)
-        
-        # حذف القنوات غير المستخدمة
         await session_manager.cleanup_unused_channels()
-        
     except asyncio.CancelledError:
         logger.info("تم إلغاء عملية الصيد")
-        
-        # حفظ حالة العملية للاستئناف
-        context.user_data['hunt_data'] = {
-            'category_id': category_id,
-            'pattern': pattern,
-            'progress_message_id': context.user_data['progress_message_id'],
-            'chat_id': context.user_data['chat_id'],
-            'extra_usernames': list(context.user_data.get('extra_usernames_set', set()))
-        }
-        
+        # تحديث حالة المهمة للاستئناف
+        run_id = context.user_data.get('run_id')
+        if run_id:
+            mark_run_finished(run_id, HUNT_STATUS_PAUSED)
         await update_progress(context, "⏸ تم إيقاف العملية مؤقتاً. يمكنك استئنافها من القائمة الرئيسية.")
     except Exception as e:
         logger.error(f"خطأ جسيم في عملية الصيد: {e}", exc_info=True)
         await update_progress(context, f"❌ فشلت عملية الصيد بسبب خطأ: {str(e)}")
     finally:
-        # إشارة التوقف لجميع العمال
         stop_event.set()
         pause_event.set()
-        
-        # إلغاء جميع المهام
         for task in tasks:
             if not task.done():
                 task.cancel()
-        
         try:
             # انتظار إنهاء المهام مع معالجة الاستثناءات
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1705,6 +1849,188 @@ async def target_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return SELECT_CATEGORY
+
+# ============================ تخزين واستئناف دائم (المرحلة 5) ============================
+HUNT_STATUS_RUNNING = 'running'
+HUNT_STATUS_PAUSED = 'paused'
+HUNT_STATUS_FINISHED = 'finished'
+
+ITEM_STATUS_PENDING = 'pending'
+ITEM_STATUS_AVAILABLE = 'available'  # متاح ومرسل للمرحلة 2
+ITEM_STATUS_RESERVED = 'reserved'    # محجوز في الفحص
+ITEM_STATUS_FRAGMENT = 'fragment'
+ITEM_STATUS_CLAIMED = 'claimed'
+ITEM_STATUS_FAILED = 'failed'
+
+def init_hunt_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                '''CREATE TABLE IF NOT EXISTS hunt_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    status TEXT,
+                    category_id TEXT,
+                    pattern TEXT,
+                    target_type TEXT,
+                    extra_usernames_json TEXT,
+                    gen_done INTEGER DEFAULT 0
+                )'''
+            )
+            cur.execute(
+                '''CREATE TABLE IF NOT EXISTS hunt_items (
+                    run_id INTEGER,
+                    username TEXT,
+                    status TEXT,
+                    score REAL,
+                    last_attempt_ts TEXT,
+                    attempts INTEGER DEFAULT 0,
+                    PRIMARY KEY(run_id, username)
+                )'''
+            )
+            cur.execute(
+                '''CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )'''
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"init_hunt_tables error: {e}")
+
+
+def create_hunt_run(category_id: str, pattern: str, target_type: str, extra_usernames: list[str]) -> int:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'INSERT INTO hunt_runs(started_at,status,category_id,pattern,target_type,extra_usernames_json) VALUES (?,?,?,?,?,?)',
+                (datetime.utcnow().isoformat(), HUNT_STATUS_RUNNING, category_id, pattern, target_type, json.dumps(extra_usernames or []))
+            )
+            run_id = cur.lastrowid
+            # حفظ معرف آخر مهمة نشطة
+            cur.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)', ('last_run_id', str(run_id)))
+            conn.commit()
+            return run_id
+    except Exception as e:
+        logger.error(f"create_hunt_run error: {e}")
+        return 0
+
+
+def mark_run_finished(run_id: int, status: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if status == HUNT_STATUS_FINISHED:
+                cur.execute('UPDATE hunt_runs SET status=?, finished_at=?, gen_done=1 WHERE id=?', (status, datetime.utcnow().isoformat(), run_id))
+            else:
+                cur.execute('UPDATE hunt_runs SET status=? WHERE id=?', (status, run_id))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"mark_run_finished error: {e}")
+
+
+def set_gen_done(run_id: int):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute('UPDATE hunt_runs SET gen_done=1 WHERE id=?', (run_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"set_gen_done error: {e}")
+
+
+def add_hunt_items_batch(run_id: int, usernames: list[str]):
+    if not usernames:
+        return
+    try:
+        rows = [(run_id, u.lstrip('@').lower(), ITEM_STATUS_PENDING, float(score_username(u.lstrip('@'))), None, 0) for u in usernames]
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.executemany(
+                'INSERT OR IGNORE INTO hunt_items(run_id,username,status,score,last_attempt_ts,attempts) VALUES (?,?,?,?,?,?)',
+                rows
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"add_hunt_items_batch error: {e}")
+
+
+def update_item_status(run_id: int, username: str, status: str, inc_attempt: bool = False):
+    try:
+        name = username.lstrip('@').lower()
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if inc_attempt:
+                cur.execute(
+                    'UPDATE hunt_items SET status=?, last_attempt_ts=?, attempts=attempts+1 WHERE run_id=? AND username=?',
+                    (status, datetime.utcnow().isoformat(), run_id, name)
+                )
+            else:
+                cur.execute(
+                    'UPDATE hunt_items SET status=?, last_attempt_ts=? WHERE run_id=? AND username=?',
+                    (status, datetime.utcnow().isoformat(), run_id, name)
+                )
+            # إذا لم يكن موجوداً مسبقاً، أدخله
+            if cur.rowcount == 0:
+                cur.execute(
+                    'INSERT OR IGNORE INTO hunt_items(run_id,username,status,score,last_attempt_ts,attempts) VALUES (?,?,?,?,?,?)',
+                    (run_id, name, status, float(score_username(name)), datetime.utcnow().isoformat(), 1 if inc_attempt else 0)
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"update_item_status error: {e}")
+
+
+def get_last_active_run() -> dict | None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT value FROM settings WHERE key=?', ('last_run_id',))
+            row = cur.fetchone()
+            if not row:
+                return None
+            run_id = int(row[0])
+            cur.execute('SELECT id, status, category_id, pattern, target_type, extra_usernames_json, gen_done FROM hunt_runs WHERE id=?', (run_id,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            return {
+                'id': r[0],
+                'status': r[1],
+                'category_id': r[2],
+                'pattern': r[3],
+                'target_type': r[4],
+                'extra_usernames': json.loads(r[5] or '[]'),
+                'gen_done': bool(r[6])
+            }
+    except Exception as e:
+        logger.error(f"get_last_active_run error: {e}")
+        return None
+
+
+def load_items_for_resume(run_id: int) -> tuple[list[tuple[float,int,str]], list[tuple[float,int,str]], set[str]]:
+    """إرجاع (pending_for_phase1, available_for_phase2, visited_set). عناصر الطوابير كـ (score, seq, @username)."""
+    pending = []
+    available = []
+    visited = set()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT username, status, score FROM hunt_items WHERE run_id=?', (run_id,))
+            rows = cur.fetchall()
+            for uname, status, score in rows:
+                u = f"@{uname}"
+                visited.add(u)
+                if status in (ITEM_STATUS_PENDING,):
+                    pending.append((float(score), next(_SEQ), u))
+                elif status in (ITEM_STATUS_AVAILABLE,):
+                    available.append((float(score), next(_SEQ), u))
+            return pending, available, visited
+    except Exception as e:
+        logger.error(f"load_items_for_resume error: {e}")
+        return pending, available, visited
 
 def main() -> None:
     """تشغيل البوت"""
