@@ -2541,12 +2541,14 @@ def main() -> None:
     )
     
     # إضافة المعالجات
+    application.add_handler(conv_handler)  # إضافة محادثة الصيد هنا
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("cleanup", cleanup_channels))
     application.add_handler(CommandHandler("pause", pause_hunt))
     application.add_handler(CommandHandler("resume", resume_command))
+    
     # أوامر التحكم متاحة أيضاً خارج المحادثة عند وجود عملية
     application.add_handler(CommandHandler("speed", cmd_speed))
     application.add_handler(CommandHandler("workers", cmd_workers))
@@ -2556,7 +2558,11 @@ def main() -> None:
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("tasks", list_tasks))
     application.add_handler(CommandHandler("task", task_command))
+    
+    # معالجات خاصة بالمهام
     application.add_handler(CallbackQueryHandler(task_callback_handler, pattern=r"^task_\d+_(status|pause|resume|cancel)$"))
+    
+    # معالج الأخطاء
     application.add_error_handler(error_handler)
     
     # بدء البوت
