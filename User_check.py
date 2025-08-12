@@ -1980,6 +1980,10 @@ def init_hunt_tables():
             except sqlite3.OperationalError:
                 pass
             conn.commit()
+            
+        # تهيئة جداول الطوابير الموزعة
+        init_distributed_queues()
+        
     except Exception as e:
         logger.error(f"init_hunt_tables error: {e}")
 
@@ -2180,6 +2184,9 @@ async def top100_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_last_active_run() -> dict | None:
     try:
+        # التأكد من وجود الجداول قبل الاستعلام
+        init_hunt_tables()
+        
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute('SELECT value FROM settings WHERE key=?', ('last_run_id',))
@@ -2207,6 +2214,43 @@ def get_last_active_run() -> dict | None:
 # ============================ طوابير موزعة عبر SQLite (المرحلة 9) ============================
 DISTRIBUTED_MODE = os.getenv('DISTRIBUTED_MODE', '0') == '1'
 LEASE_SECONDS = 30
+
+def load_items_for_resume(run_id: int) -> tuple[list, list, set]:
+    """تحميل العناصر المحفوظة لاستئناف المهمة"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            
+            # تحميل العناصر المعلقة (pending)
+            cur.execute('''
+                SELECT username, status, score 
+                FROM hunt_items 
+                WHERE run_id=? AND status IN ('pending', 'checking')
+                ORDER BY score DESC
+            ''', (run_id,))
+            pending = [(u, s, score) for u, s, score in cur.fetchall()]
+            
+            # تحميل العناصر المتاحة (available)
+            cur.execute('''
+                SELECT username, status, score 
+                FROM hunt_items 
+                WHERE run_id=? AND status='available'
+                ORDER BY score DESC
+            ''', (run_id,))
+            available = [(u, s, score) for u, s, score in cur.fetchall()]
+            
+            # تحميل العناصر التي تمت زيارتها
+            cur.execute('''
+                SELECT username 
+                FROM hunt_items 
+                WHERE run_id=?
+            ''', (run_id,))
+            visited = {row[0] for row in cur.fetchall()}
+            
+            return pending, available, visited
+    except Exception as e:
+        logger.error(f"load_items_for_resume error: {e}")
+        return [], [], set()
 
 def init_distributed_queues():
     if not DISTRIBUTED_MODE:
